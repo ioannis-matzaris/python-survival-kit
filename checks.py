@@ -1,111 +1,97 @@
-"""Οι έλεγχοι του lab. Τρέξε: python3 checks.py"""
-
-import contextlib
-import importlib.util
-import io
 import subprocess
 import sys
 from pathlib import Path
-from types import ModuleType
 
-ROOT = Path(__file__).parent
-ORDER_LINE = "ΚΩΔ-4471;Καφετιέρα;;41.60"
+HERE = Path(__file__).resolve().parent
+
+VARIANTS = [
+    "ΚΩΔ-4471;Καφετιέρα; 5,35 € ;5 τεμ;10%",
+    "ΚΩΔ-4471;Καφετιέρα;5.35;5;10",
+    "ΚΩΔ-4471;Καφετιέρα;  5,35€ ;  5 τεμ  ; 10 %",
+]
 
 
-def load_orders() -> tuple[ModuleType | None, str]:
-    path = ROOT / "orders.py"
+def run(script: str, stdin_text: str) -> tuple[int, list[str]]:
+    path = HERE / script
     if not path.exists():
-        return None, "δεν υπάρχει αρχείο orders.py"
-    spec = importlib.util.spec_from_file_location("orders", path)
-    if spec is None or spec.loader is None:
-        return None, "το orders.py δεν φορτώνεται"
-    module = importlib.util.module_from_spec(spec)
-    try:
-        with contextlib.redirect_stdout(io.StringIO()):
-            spec.loader.exec_module(module)
-    except SyntaxError as error:
-        return None, f"SyntaxError στη γραμμή {error.lineno}"
-    except Exception as error:
-        return None, f"{type(error).__name__}: {error}"
-    return module, ""
-
-
-def check_interpreter() -> tuple[bool, str]:
-    major, minor = sys.version_info[:2]
-    if (major, minor) == (3, 11):
-        return True, ""
-    return False, f"βρήκα {major}.{minor}"
-
-
-def check_orders_compiles(orders: ModuleType | None, reason: str) -> tuple[bool, str]:
-    if orders is None:
-        return False, reason
-    return True, ""
-
-
-def check_line_total(orders: ModuleType | None, reason: str) -> tuple[bool, str]:
-    if orders is None:
-        return False, reason
-    function = getattr(orders, "line_total", None)
-    if function is None:
-        return False, "δεν βρήκα συνάρτηση line_total"
-    try:
-        result = function(ORDER_LINE, 3.50)
-    except Exception as error:
-        return False, f"{type(error).__name__}: {error}"
-    if result == 45.1:
-        return True, ""
-    return False, f"επέστρεψε {result!r}"
-
-
-def check_return_hint(orders: ModuleType | None, reason: str) -> tuple[bool, str]:
-    if orders is None:
-        return False, reason
-    function = getattr(orders, "line_total", None)
-    if function is None:
-        return False, "δεν βρήκα συνάρτηση line_total"
-    hint = getattr(function, "__annotations__", {}).get("return")
-    if hint is float:
-        return True, ""
-    name = getattr(hint, "__name__", repr(hint))
-    return False, f"το hint λέει {name}"
-
-
-def check_discount() -> tuple[bool, str]:
-    path = ROOT / "discount.py"
-    if not path.exists():
-        return False, "δεν υπάρχει αρχείο discount.py"
+        return 1, [f"δεν βρέθηκε αρχείο {script}"]
     finished = subprocess.run(
-        [sys.executable, str(path)], capture_output=True, text=True
+        [sys.executable, str(path)],
+        input=stdin_text + "\n",
+        capture_output=True,
+        text=True,
     )
-    if finished.returncode != 0:
-        last_line = finished.stderr.strip().splitlines()[-1:]
-        return False, last_line[0] if last_line else "τερμάτισε με σφάλμα"
-    lines = finished.stdout.strip().splitlines()
-    if lines == ["3.33", "38.27"]:
-        return True, ""
-    return False, f"τύπωσε {lines}"
+    return finished.returncode, finished.stdout.splitlines()
 
 
-def main() -> None:
-    orders, reason = load_orders()
-    results = [
-        ("Ο interpreter είναι Python 3.11", check_interpreter()),
-        ("Το orders.py μεταφράζεται χωρίς SyntaxError", check_orders_compiles(orders, reason)),
-        ("Η line_total επιστρέφει 45.1", check_line_total(orders, reason)),
-        ("Το type hint επιστροφής της line_total είναι float", check_return_hint(orders, reason)),
-        ("Το discount.py τυπώνει 3.33 και 38.27", check_discount()),
-    ]
-    passed = 0
-    for label, (ok, detail) in results:
-        if ok:
-            passed += 1
-            print(f"✅ {label}")
-        else:
-            print(f"❌ {label} ({detail})")
-    print()
-    print(f"{passed}/{len(results)}")
+def line(output: list[str], index: int) -> str:
+    return output[index] if index < len(output) else "<λείπει>"
 
 
-if __name__ == "__main__":
-    main()
+results: list[tuple[bool, str, str]] = []
+
+
+def check(ok: bool, title: str, detail: str = "") -> None:
+    results.append((ok, title, detail))
+
+
+runs = [run("receipt.py", variant) for variant in VARIANTS]
+
+failed = [i for i, (code, _) in enumerate(runs) if code != 0]
+check(
+    not failed,
+    "Το receipt.py τρέχει χωρίς σφάλμα και με τα τρία input",
+    "" if not failed else f"σκάει στο input: {VARIANTS[failed[0]]}",
+)
+
+first = runs[0][1]
+check(
+    line(first, 2) == "Καθαρή αξία: 26.75",
+    "Τυπώνει Καθαρή αξία: 26.75",
+    f"βρήκα: {line(first, 2)}",
+)
+check(
+    line(first, 3) == "Έκπτωση: 2.68" and line(first, 4) == "Πληρωτέο: 24.07",
+    "Τυπώνει Έκπτωση: 2.68 και Πληρωτέο: 24.07",
+    f"βρήκα: {line(first, 3)} / {line(first, 4)}",
+)
+check(
+    line(first, 1) == "Έγκυρος κωδικός: True",
+    "Τυπώνει Έγκυρος κωδικός: True",
+    f"βρήκα: {line(first, 1)}",
+)
+
+source_ok = all(
+    line(output, 5) == f"Πηγή: {variant}"
+    for variant, (_, output) in zip(VARIANTS, runs)
+)
+check(
+    source_ok,
+    "Η γραμμή Πηγή επιστρέφει ακριβώς τη γραμμή που δόθηκε",
+    f"βρήκα: {line(first, 5)}",
+)
+
+heads = {tuple(output[:5]) for _, output in runs}
+check(
+    len(heads) == 1,
+    "Και τα τρία input δίνουν τις ίδιες πέντε πρώτες γραμμές",
+    f"βρήκα {len(heads)} διαφορετικά αποτελέσματα",
+)
+
+vat_code, vat_out = run("vat.py", "74,40 €")
+check(
+    vat_code == 0 and vat_out[:2] == ["60.00", "14.40"],
+    "Το vat.py τυπώνει 60.00 και 14.40",
+    f"βρήκα: {vat_out[:2]}",
+)
+
+passed = 0
+for ok, title, detail in results:
+    if ok:
+        passed += 1
+        print(f"✅ {title}")
+    else:
+        print(f"❌ {title} - {detail}")
+
+print()
+print(f"{passed}/{len(results)}")
