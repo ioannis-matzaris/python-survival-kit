@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Τα δεδομένα του lab τα φτιάχνει το make_data.py
+sales.txt
+products.txt
