@@ -1,72 +1,37 @@
-"""Φτιάχνει τα δύο αρχεία δεδομένων του lab.
+"""Φτιάχνει το readings.txt. Τα δεδομένα δεν μπαίνουν στο git, ο κώδικας που τα φτιάχνει ναι."""
 
-Τρέξ' το μία φορά:
+from pathlib import Path
 
-    python3 make_data.py
+READINGS: dict[str, list[int]] = {
+    "ΜΤ-1001": [180, 210, 195],
+    "ΜΤ-1002": [420, 390, 445],
+    "ΜΤ-1003": [95, 120, 88],
+    "ΜΤ-1004": [610, 580, 640],
+    "ΜΤ-1005": [310, 275, 330],
+    "ΜΤ-1006": [150, 165, 140],
+    "ΜΤ-1007": [980, 1120, 1040],
+    "ΜΤ-1008": [230, 260, 245],
+    "ΜΤ-1009": [520, 495, 555],
+    "ΜΤ-1010": [75, 90, 82],
+    "ΜΤ-1011": [340, 315, 360],
+    "ΜΤ-1012": [700, 745, 690],
+}
 
-Τα αρχεία δεν είναι στο git επειδή το sales.txt είναι πάνω από 2 MB.
-Ο κώδικας που τα φτιάχνει είναι, οπότε βγαίνουν ακριβώς τα ίδια σε κάθε μηχάνημα.
-"""
+MONTHS: list[str] = ["2024-01", "2024-02", "2024-03"]
 
-import random
-
-CATEGORIES = [
-    "Τρόφιμα",
-    "Ηλεκτρονικά",
-    "Ένδυση",
-    "Βιβλία",
-    "Καθαριστικά",
-    "Παιχνίδια",
-]
-
-COUPONS = [""] * 12 + [
-    "KALOKAIRI10",
-    "BLACKFRIDAY25",
-    "WELCOME5",
-    "PASXA15",
-    "XMAS20",
-]
-
-PRODUCT_COUNT = 4_000
-SALE_COUNT = 50_000
-CUSTOMER_COUNT = 40_000
-
-
-def write_products(generator: random.Random) -> list[str]:
-    codes: list[str] = []
-    lines: list[str] = []
-    for number in range(1, PRODUCT_COUNT + 1):
-        code = f"ΠΡ-{number:04d}"
-        codes.append(code)
-        lines.append(f"{code};{generator.choice(CATEGORIES)}")
-    with open("products.txt", "w", encoding="utf-8") as handle:
-        handle.write("\n".join(lines) + "\n")
-    return codes
-
-
-def write_sales(generator: random.Random, codes: list[str]) -> None:
-    customers = [str(100_000_000 + generator.randrange(800_000_000)) for _ in range(CUSTOMER_COUNT)]
-    lines: list[str] = []
-    for number in range(1, SALE_COUNT + 1):
-        order = f"ΠΑΡ-{number:06d}"
-        day = generator.randrange(365)
-        date = f"2024-{day // 31 + 1:02d}-{day % 28 + 1:02d}"
-        afm = generator.choice(customers)
-        code = generator.choice(codes)
-        quantity = generator.randint(1, 5)
-        price = round(generator.uniform(1.20, 480.00), 2)
-        coupon = generator.choice(COUPONS)
-        lines.append(f"{order};{date};{afm};{code};{quantity};{price:.2f};{coupon}")
-    with open("sales.txt", "w", encoding="utf-8") as handle:
-        handle.write("\n".join(lines) + "\n")
+# Οι μετρήσεις του ΜΤ-1011 για Φεβρουάριο και Μάρτιο ήρθαν από άλλο export.
+DIRTY: set[tuple[str, str]] = {("ΜΤ-1011", "2024-02"), ("ΜΤ-1011", "2024-03")}
 
 
 def main() -> None:
-    generator = random.Random(20240301)
-    codes = write_products(generator)
-    write_sales(generator, codes)
-    print(f"products.txt: {PRODUCT_COUNT} γραμμές")
-    print(f"sales.txt: {SALE_COUNT} γραμμές")
+    lines: list[str] = []
+    for meter, monthly in READINGS.items():
+        for month, kwh in zip(MONTHS, monthly):
+            name = f"{meter} " if (meter, month) in DIRTY else meter
+            lines.append(f"{name};{month};{kwh}")
+    Path("readings.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"Έγραψα readings.txt με {len(lines)} γραμμές")
 
 
-main()
+if __name__ == "__main__":
+    main()
