@@ -1,2 +1,3 @@
-readings.txt
+data/athens.json
+output/report.txt
 __pycache__/

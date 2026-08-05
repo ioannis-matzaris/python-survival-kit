@@ -1,132 +1,135 @@
-"""Οι έλεγχοι του lab. Τρέξε: python3 checks.py"""
+"""Οι έλεγχοι του lab. Τρέξε: python3 checks.py
 
+Δεν βγαίνει στο internet. Ξαναϋπολογίζει τα min και max από το data/athens.json
+που κατέβασες εσύ, οπότε δίνει την ίδια απάντηση σήμερα και σε τρεις εβδομάδες.
+"""
+
+import json
 import subprocess
 import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-EXPECTED_LINES = 36
-EXPECTED_METERS = 12
-EXPECTED_TOP3 = [("ΜΤ-1007", 3140), ("ΜΤ-1012", 2135), ("ΜΤ-1004", 1830)]
-EXPECTED_TOTAL_COST = 2079.60
-
-results: list[tuple[bool, str, str]] = []
+DATA = HERE / "data" / "athens.json"
+REPORT = HERE / "output" / "report.txt"
+HEADER = "Πρόγνωση για Αθήνα"
+NETWORK_WORDS = ("urllib", "urlopen", "http")
 
 
-def check(passed: bool, title: str, detail: str = "") -> None:
-    results.append((passed, title, detail))
+class Failed(Exception):
+    pass
 
 
-def data_lines() -> list[str]:
-    path = HERE / "readings.txt"
-    if not path.exists():
-        return []
-    return path.read_text(encoding="utf-8").splitlines()
-
-
-lines = data_lines()
-check(
-    len(lines) == EXPECTED_LINES,
-    "Το readings.txt υπάρχει με 36 γραμμές",
-    f"βρήκα {len(lines)} γραμμές, τρέξε python3 make_data.py",
-)
-
-run = subprocess.run(
-    [sys.executable, "billing.py"], cwd=HERE, capture_output=True, text=True
-)
-check(
-    run.returncode == 0,
-    "Το billing.py τρέχει από την αρχή ως το τέλος χωρίς σφάλμα",
-    (run.stderr.strip().splitlines() or ["-"])[-1],
-)
-
-try:
-    import billing
-except Exception as error:
-    print(f"❌ Το billing.py δεν κάνει καν import: {error}")
-    raise SystemExit(1)
-
-
-def call(name: str, *args: object) -> object:
-    function = getattr(billing, name, None)
-    if function is None:
-        return f"δεν υπάρχει συνάρτηση {name}"
+def days_from_data() -> tuple[dict[str, list[float]], int]:
+    if not DATA.exists():
+        raise Failed("δεν βρήκα το data/athens.json, τρέξε πρώτα το fetch.py")
     try:
-        return function(*args)
-    except Exception as error:
-        return f"{type(error).__name__}: {error}"
+        payload = json.loads(DATA.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise Failed(f"το data/athens.json δεν είναι έγκυρο JSON: {error}")
+    hourly = payload.get("hourly")
+    if not isinstance(hourly, dict):
+        raise Failed("το data/athens.json δεν έχει hourly, δες τι σου απάντησε το API")
+    times = hourly.get("time")
+    temps = hourly.get("temperature_2m")
+    if not isinstance(times, list) or not isinstance(temps, list):
+        raise Failed("το hourly δεν έχει time και temperature_2m ως λίστες")
+    if not times or len(times) != len(temps):
+        raise Failed(f"time και temperature_2m έχουν μήκη {len(times)} και {len(temps)}")
+    grouped: dict[str, list[float]] = {}
+    for stamp, value in zip(times, temps):
+        grouped.setdefault(str(stamp)[:10], []).append(float(value))
+    return grouped, len(times)
 
 
-totals = call("kwh_per_meter", lines)
-check(
-    isinstance(totals, dict) and len(totals) == EXPECTED_METERS,
-    "Η kwh_per_meter βρίσκει ακριβώς 12 μετρητές",
-    f"βρήκα {len(totals) if isinstance(totals, dict) else totals}",
-)
+def check_data() -> tuple[dict[str, list[float]], str]:
+    grouped, hours = days_from_data()
+    return grouped, f"data/athens.json: {hours} ώρες, {len(grouped)} μέρες"
 
-meter_1011 = totals.get("ΜΤ-1011") if isinstance(totals, dict) else None
-check(
-    meter_1011 == 1015,
-    "Ο ΜΤ-1011 βγάζει 1015 kWh, με όλες τις μετρήσεις του μαζί",
-    f"βρήκα {meter_1011}",
-)
 
-top3 = call("top_consumers", totals if isinstance(totals, dict) else {}, 3)
-check(
-    top3 == EXPECTED_TOP3,
-    "Η top_consumers δίνει τους τρεις κορυφαίους, από τον μεγαλύτερο",
-    f"βρήκα {top3}",
-)
+def check_report_is_offline() -> str:
+    path = HERE / "report.py"
+    if not path.exists():
+        raise Failed("δεν βρήκα το report.py")
+    text = path.read_text(encoding="utf-8")
+    found = [word for word in NETWORK_WORDS if word in text]
+    if found:
+        raise Failed(f"το report.py αναφέρει ακόμα {found[0]}, σβήσ' το εντελώς")
+    return "report.py: δεν αγγίζει το δίκτυο"
 
-top5 = call("top_consumers", totals if isinstance(totals, dict) else {}, 5)
-check(
-    isinstance(top5, list) and len(top5) == 5,
-    "Η top_consumers σέβεται το limit και με 5",
-    f"βρήκα {top5}",
-)
 
-price_high = call("price_for", 3140)
-price_low = call("price_for", 300)
-check(
-    price_high == 0.18 and price_low == 0.09,
-    "Η price_for δίνει τιμή και για κατανάλωση πάνω από τη μεγαλύτερη ζώνη",
-    f"για 3140 βρήκα {price_high}, για 300 βρήκα {price_low}",
-)
+def check_report_runs(day_count: int) -> str:
+    expected = f"Γράφτηκαν {day_count} μέρες στο output/report.txt"
+    finished = subprocess.run(
+        [sys.executable, "report.py"], cwd=HERE, capture_output=True, text=True
+    )
+    if finished.returncode != 0:
+        last = (finished.stderr.strip().splitlines() or ["-"])[-1]
+        raise Failed(f"το report.py έσκασε: {last}")
+    printed = finished.stdout.strip().splitlines()
+    if len(printed) != 1:
+        raise Failed(f"περίμενα μία γραμμή στην οθόνη, βρήκα {len(printed)}")
+    if printed[0] != expected:
+        raise Failed(f'τύπωσε "{printed[0]}", περίμενα "{expected}"')
+    return f'report.py: τύπωσε "{expected}"'
 
-cost_high = call("cost_of", 3140)
-check(
-    cost_high == 565.20,
-    "Η cost_of χρεώνει σωστά τον ΜΤ-1007 με 3140 kWh",
-    f"βρήκα {cost_high}",
-)
 
-swallowed = call("cost_of", "3140")
-check(
-    isinstance(swallowed, str) and swallowed.startswith("TypeError"),
-    "Η cost_of δεν καταπίνει σφάλματα που δεν ξέρει να χειριστεί",
-    f"με string όρισμα επέστρεψε {swallowed} αντί να σκάσει",
-)
+def report_lines() -> list[str]:
+    if not REPORT.exists():
+        raise Failed("δεν βρήκα το output/report.txt")
+    try:
+        text = REPORT.read_text(encoding="utf-8")
+    except UnicodeDecodeError as error:
+        raise Failed(f"το output/report.txt δεν διαβάζεται ως UTF-8: {error}")
+    return text.splitlines()
 
-if isinstance(totals, dict) and totals:
-    costs = [call("cost_of", kwh) for kwh in totals.values()]
-    total_cost = round(sum(c for c in costs if isinstance(c, float)), 2)
-else:
-    total_cost = None
-check(
-    total_cost == EXPECTED_TOTAL_COST,
-    "Το συνολικό κόστος όλων των μετρητών είναι 2079.60 ευρώ",
-    f"βρήκα {total_cost}",
-)
 
-passed = 0
-for ok, title, detail in results:
-    if ok:
-        print(f"✅ {title}")
-        passed += 1
-    else:
-        print(f"❌ {title}")
-        if detail:
-            print(f"   {detail}")
+def check_header() -> str:
+    lines = report_lines()
+    if not lines:
+        raise Failed("το output/report.txt είναι άδειο")
+    if lines[0] != HEADER:
+        raise Failed(f'η πρώτη γραμμή είναι "{lines[0]}", περίμενα "{HEADER}"')
+    return "output/report.txt: σωστή επικεφαλίδα, έγκυρο UTF-8"
 
-print()
-print(f"{passed}/{len(results)}")
+
+def check_days(grouped: dict[str, list[float]]) -> str:
+    lines = report_lines()[1:]
+    if len(lines) != len(grouped):
+        raise Failed(f"βρήκα {len(lines)} γραμμές μετά την επικεφαλίδα, περίμενα {len(grouped)}")
+    for line, day in zip(lines, grouped):
+        values = grouped[day]
+        expected = f"{day}: min {min(values):.1f}C max {max(values):.1f}C"
+        if line != expected:
+            raise Failed(f'γραμμή "{line}", περίμενα "{expected}"')
+    return f"output/report.txt: {len(grouped)} γραμμές, min/max σύμφωνα με τα δεδομένα"
+
+
+def main() -> None:
+    number = 0
+    try:
+        number = 1
+        grouped, label = check_data()
+        print(f"✅ 1. {label}")
+
+        number = 2
+        print(f"✅ 2. {check_report_is_offline()}")
+
+        number = 3
+        print(f"✅ 3. {check_report_runs(len(grouped))}")
+
+        number = 4
+        print(f"✅ 4. {check_header()}")
+
+        number = 5
+        print(f"✅ 5. {check_days(grouped)}")
+    except Failed as problem:
+        print(f"❌ {number}. {problem}")
+        raise SystemExit(1)
+
+    print()
+    print("Όλα πέρασαν.")
+
+
+if __name__ == "__main__":
+    main()
