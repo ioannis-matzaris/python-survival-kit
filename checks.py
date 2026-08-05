@@ -1,128 +1,91 @@
-"""Οι έλεγχοι του lab. Τρέξε: python3 checks.py
+"""Ο βαθμολογητής του lab. Τρέξε: python3 checks.py
 
-Δεν κατεβάζει τίποτα. Κοιτάζει τα αρχεία σου και το περιβάλλον που έφτιαξες.
+Δεν βαθμολογεί την υλοποίησή σου, βαθμολογεί το suite σου. Αντιγράφει το
+test_shipping.py δίπλα σε κάθε υλοποίηση και κοιτάει αν περνάει ή κοκκινίζει.
 """
 
-import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-VENV = HERE / ".venv"
-VENV_PYTHON = VENV / "bin" / "python"
-PACKAGE = "tabulate"
-VERSION = "0.9.0"
+SUITE = HERE / "test_shipping.py"
+MIN_TESTS = 8
 
-EXPECTED_REPORT = """Προϊόν           Κατάστημα      Τιμή
----------------  -----------  ------
-Καλώδιο HDMI     Public         6.90
-Ποντίκι          Kotsovolos    12.50
-Ακουστικά        Kotsovolos    29.90
-Πληκτρολόγιο     Public        45.00
-Οθόνη 24 ιντσών  Plaisio      159.90
-ΣΥΝΟΛΟ: 254.20 ευρώ"""
+MUTANTS = [
+    ("m1", "κουπόνι κάτω από το μηδέν", "m1_coupon_below_zero.py"),
+    ("m2", "κλάσμα κιλού στα μεταφορικά", "m2_truncated_weight.py"),
+    ("m3", "όριο των 40 ευρώ", "m3_free_shipping_boundary.py"),
+    ("m4", "άγνωστο κουπόνι", "m4_silent_unknown_coupon.py"),
+    ("m5", "quantity στο subtotal", "m5_ignores_quantity.py"),
+]
 
-results: list[tuple[bool, str, str]] = []
+results: list[tuple[bool, str]] = []
 
 
-def check(ok: bool, title: str, detail: str = "") -> None:
-    results.append((ok, title, detail))
+def run_suite_against(implementation: Path) -> tuple[int, str]:
+    """Τρέχει το suite του μαθητή δίπλα σε μια υλοποίηση, σε δικό της φάκελο."""
+    with tempfile.TemporaryDirectory() as room:
+        sandbox = Path(room)
+        shutil.copy(implementation, sandbox / "shipping.py")
+        shutil.copy(SUITE, sandbox / "test_shipping.py")
+        finished = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "test_shipping.py"],
+            cwd=sandbox,
+            capture_output=True,
+            text=True,
+        )
+        return finished.returncode, finished.stdout
 
 
-venv_ok = (VENV / "pyvenv.cfg").exists() and VENV_PYTHON.exists()
-check(
-    venv_ok,
-    "Υπάρχει virtualenv στον φάκελο .venv",
-    "" if venv_ok else "δεν βρήκα .venv/pyvenv.cfg και .venv/bin/python, τρέξε python3 -m venv .venv",
-)
-
-installed = ""
-if venv_ok:
-    frozen = subprocess.run(
-        [str(VENV_PYTHON), "-m", "pip", "freeze"], capture_output=True, text=True
+def collected_tests() -> int:
+    finished = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", str(SUITE)],
+        cwd=HERE,
+        capture_output=True,
+        text=True,
     )
-    for line in frozen.stdout.splitlines():
-        if line.lower().startswith(f"{PACKAGE}=="):
-            installed = line.split("==", 1)[1].strip()
-            break
-check(
-    installed == VERSION,
-    f"Το {PACKAGE} {VERSION} είναι εγκατεστημένο μέσα σε αυτό",
-    "δεν είναι εγκατεστημένο μέσα στο .venv" if not installed else f"βρήκα την έκδοση {installed}",
-)
+    return sum(1 for line in finished.stdout.splitlines() if "::" in line)
 
-requirements = HERE / "requirements.txt"
-lines = []
-if requirements.exists():
-    lines = [line.strip() for line in requirements.read_text(encoding="utf-8").splitlines() if line.strip()]
-loose = [line for line in lines if not re.match(r"^[A-Za-z0-9._-]+==", line)]
-check(
-    bool(lines) and not loose,
-    "Το requirements.txt καρφώνει κάθε γραμμή με ==",
-    "δεν βρήκα requirements.txt με περιεχόμενο" if not lines
-    else (f'η γραμμή "{loose[0]}" δεν καρφώνει έκδοση' if loose else ""),
-)
 
-pinned = next((line for line in lines if line.lower().startswith(f"{PACKAGE}==")), "")
-check(
-    pinned == f"{PACKAGE}=={VERSION}" and installed == VERSION,
-    "Το requirements.txt συμφωνεί με ό,τι είναι εγκατεστημένο",
-    f'το αρχείο λέει "{pinned or "τίποτα"}" και εγκατεστημένο είναι "{installed or "τίποτα"}"',
-)
+if not SUITE.exists():
+    print("[1/8] Το test_shipping.py υπάρχει και δίνει 8+ tests       ❌")
+    print("[2/8] Το suite περνάει στο δικό σου shipping.py            ❌")
+    print("[3/8] Το suite περνάει στη σωστή υλοποίηση                 ❌")
+    for index, (tag, label, _) in enumerate(MUTANTS, start=4):
+        print(f"[{index}/8] Το suite πιάνει το {tag} ({label})".ljust(58) + " ❌")
+    print()
+    print("Σκορ: 0/8")
+    print()
+    print("Δεν βρήκα test_shipping.py στη ρίζα. Ξεκίνα από την Αποστολή 1.")
+    raise SystemExit(1)
 
-report = HERE / "report.py"
-if not report.exists():
-    check(False, "Το report.py τυπώνει ακριβώς την αναμενόμενη αναφορά", "δεν βρήκα report.py")
-elif not venv_ok:
-    check(False, "Το report.py τυπώνει ακριβώς την αναμενόμενη αναφορά", "χρειάζεται πρώτα το .venv")
-else:
-    run = subprocess.run(
-        [str(VENV_PYTHON), "report.py"], cwd=HERE, capture_output=True, text=True
-    )
-    if run.returncode != 0:
-        check(False, "Το report.py τυπώνει ακριβώς την αναμενόμενη αναφορά",
-              (run.stderr.strip().splitlines() or ["-"])[-1])
-    else:
-        produced = run.stdout.rstrip("\n")
-        if produced == EXPECTED_REPORT:
-            check(True, "Το report.py τυπώνει ακριβώς την αναμενόμενη αναφορά")
-        else:
-            mine = produced.splitlines()
-            theirs = EXPECTED_REPORT.splitlines()
-            spot = next(
-                (i for i in range(max(len(mine), len(theirs)))
-                 if (mine[i] if i < len(mine) else None) != (theirs[i] if i < len(theirs) else None)),
-                0,
-            )
-            got = mine[spot] if spot < len(mine) else "<λείπει>"
-            want = theirs[spot] if spot < len(theirs) else "<περισσεύει>"
-            check(False, "Το report.py τυπώνει ακριβώς την αναμενόμενη αναφορά",
-                  f'γραμμή {spot + 1}: "{got}", περίμενα "{want}"')
+found = collected_tests()
+results.append((found >= MIN_TESTS, f"Το test_shipping.py υπάρχει και δίνει 8+ tests ({found})"))
 
-ignore = HERE / ".gitignore"
-ignored = False
-if ignore.exists():
-    entries = [line.strip().rstrip("/") for line in ignore.read_text(encoding="utf-8").splitlines()]
-    ignored = ".venv" in entries
-tracked = subprocess.run(
-    ["git", "ls-files", "--error-unmatch", ".venv"], cwd=HERE, capture_output=True, text=True
-).returncode == 0
-check(
-    ignored and not tracked,
-    "Το .gitignore κρατάει το .venv έξω από το git",
-    "το .venv είναι ήδη στο git" if tracked else "δεν βρήκα γραμμή .venv/ στο .gitignore",
-)
+own_code, own_output = run_suite_against(HERE / "shipping.py")
+results.append((own_code == 0, "Το suite περνάει στο δικό σου shipping.py"))
+
+ref_code, ref_output = run_suite_against(HERE / "reference" / "shipping.py")
+results.append((ref_code == 0, "Το suite περνάει στη σωστή υλοποίηση"))
+
+for tag, label, filename in MUTANTS:
+    code, _ = run_suite_against(HERE / "mutants" / filename)
+    results.append((code != 0, f"Το suite πιάνει το {tag} ({label})"))
 
 passed = 0
-for number, (ok, title, detail) in enumerate(results, start=1):
+for number, (ok, title) in enumerate(results, start=1):
+    mark = "✅" if ok else "❌"
     if ok:
         passed += 1
-        print(f"✅ {number}. {title}")
-    else:
-        print(f"❌ {number}. {title}")
-        if detail:
-            print(f"     {detail}")
+    print(f"[{number}/{len(results)}] {title}".ljust(58) + f" {mark}")
 
 print()
-print(f"{passed}/{len(results)}")
+print(f"Σκορ: {passed}/{len(results)}")
+
+if not results[2][0]:
+    print()
+    print("Το suite σου κοκκινίζει στη σωστή υλοποίηση. Κάποιο test περιμένει")
+    print("κάτι που η προδιαγραφή δεν λέει. Ξαναδιάβασε τους κανόνες.")
