@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Το φτιάχνει ο μαθητής στην αποστολή 3
+delivery
