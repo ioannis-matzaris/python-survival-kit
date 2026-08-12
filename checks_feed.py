@@ -1,4 +1,5 @@
 import json
+import shutil
 import subprocess
 import sys
 
@@ -74,8 +75,10 @@ EXPECTED_OUTPUT = [
     "Δεκτές 2 από 4 προσφορές",
 ]
 
+shutil.rmtree("__pycache__", ignore_errors=True)
+
 probe = subprocess.run(
-    [sys.executable, "-c", PROBE], capture_output=True, text=True, stdin=subprocess.DEVNULL
+    [sys.executable, "-B", "-c", PROBE], capture_output=True, text=True, stdin=subprocess.DEVNULL
 )
 if "BdbQuit" in probe.stdout or "BdbQuit" in probe.stderr:
     facts = {"import_error": "έμεινε ένα breakpoint() στον κώδικα, σβήσ' το"}
@@ -148,7 +151,7 @@ else:
 
 label = "Το feed.py τρέχει ως το τέλος και τυπώνει τις σωστές γραμμές"
 run = subprocess.run(
-    [sys.executable, "feed.py"], capture_output=True, text=True, stdin=subprocess.DEVNULL
+    [sys.executable, "-B", "feed.py"], capture_output=True, text=True, stdin=subprocess.DEVNULL
 )
 if "BdbQuit" in run.stderr or "(Pdb)" in run.stdout:
     report(False, label, "έμεινε ένα breakpoint() μέσα στο feed.py, σβήσ' το")
