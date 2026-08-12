@@ -86,7 +86,7 @@ else:
     else:
         report(False, label, f"περίμενα {EXPECTED_OUTPUT} και πήρα {output}")
 
-label = "Η build_stock μετράει κάθε κίνηση που ξέρει, και την ΕΠΙΣΤΡΟΦΗ μαζί"
+label = "Η build_stock μετράει κάθε κίνηση που ξέρει, την ΕΠΙΣΤΡΟΦΗ μαζί"
 if "import_error" in facts:
     report(False, label, str(facts["import_error"]))
 elif "build_error" in facts:
