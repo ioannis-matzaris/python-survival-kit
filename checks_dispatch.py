@@ -1,4 +1,5 @@
 import json
+import shutil
 import re
 import subprocess
 import sys
@@ -74,8 +75,10 @@ FRAME = re.compile(r'^\s+File "(?P<path>[^"]+)", line \d+, in (?P<function>\S+)\
 
 
 def run_json(source: str) -> dict[str, object]:
-    probe = subprocess.run(
-        [sys.executable, "-c", source], capture_output=True, text=True, stdin=subprocess.DEVNULL
+    shutil.rmtree("__pycache__", ignore_errors=True)
+
+probe = subprocess.run(
+        [sys.executable, "-B", "-c", source], capture_output=True, text=True, stdin=subprocess.DEVNULL
     )
     if "BdbQuit" in probe.stdout or "BdbQuit" in probe.stderr:
         return {"import_error": "έμεινε ένα breakpoint() στον κώδικα, σβήσ' το"}
@@ -88,7 +91,7 @@ def run_json(source: str) -> dict[str, object]:
 
 def crash_of(name: str) -> dict[str, str]:
     run = subprocess.run(
-        [sys.executable, f"{name}.py"], capture_output=True, text=True, stdin=subprocess.DEVNULL
+        [sys.executable, "-B", f"{name}.py"], capture_output=True, text=True, stdin=subprocess.DEVNULL
     )
     if run.returncode == 0:
         return {"no_crash": "τρέχει χωρίς σφάλμα"}
@@ -117,7 +120,7 @@ def report(ok: bool, label: str, detail: str = "") -> None:
 
 label = "Το dispatch.py τρέχει ως το τέλος και τυπώνει τις σωστές γραμμές"
 run = subprocess.run(
-    [sys.executable, "dispatch.py"], capture_output=True, text=True, stdin=subprocess.DEVNULL
+    [sys.executable, "-B", "dispatch.py"], capture_output=True, text=True, stdin=subprocess.DEVNULL
 )
 if run.returncode != 0:
     tail = run.stderr.strip().splitlines()
