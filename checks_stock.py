@@ -1,4 +1,5 @@
 import json
+import shutil
 import subprocess
 import sys
 
@@ -53,8 +54,10 @@ EXPECTED_OUTPUT = [
     "Κινήσεις που προσπεράστηκαν: 2 (γραμμές 5, 7)",
 ]
 
+shutil.rmtree("__pycache__", ignore_errors=True)
+
 probe = subprocess.run(
-    [sys.executable, "-c", PROBE], capture_output=True, text=True, stdin=subprocess.DEVNULL
+    [sys.executable, "-B", "-c", PROBE], capture_output=True, text=True, stdin=subprocess.DEVNULL
 )
 if "BdbQuit" in probe.stdout or "BdbQuit" in probe.stderr:
     facts = {"import_error": "έμεινε ένα breakpoint() στον κώδικα, σβήσ' το"}
@@ -74,7 +77,7 @@ def report(ok: bool, label: str, detail: str = "") -> None:
 
 label = "Το stock.py τρέχει ως το τέλος και τυπώνει το σωστό απόθεμα"
 run = subprocess.run(
-    [sys.executable, "stock.py"], capture_output=True, text=True, stdin=subprocess.DEVNULL
+    [sys.executable, "-B", "stock.py"], capture_output=True, text=True, stdin=subprocess.DEVNULL
 )
 if run.returncode != 0:
     tail = run.stderr.strip().splitlines()
