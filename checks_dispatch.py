@@ -1,6 +1,6 @@
 import json
-import shutil
 import re
+import shutil
 import subprocess
 import sys
 
@@ -75,9 +75,7 @@ FRAME = re.compile(r'^\s+File "(?P<path>[^"]+)", line \d+, in (?P<function>\S+)\
 
 
 def run_json(source: str) -> dict[str, object]:
-    shutil.rmtree("__pycache__", ignore_errors=True)
-
-probe = subprocess.run(
+    probe = subprocess.run(
         [sys.executable, "-B", "-c", source], capture_output=True, text=True, stdin=subprocess.DEVNULL
     )
     if "BdbQuit" in probe.stdout or "BdbQuit" in probe.stderr:
@@ -107,6 +105,8 @@ def crash_of(name: str) -> dict[str, str]:
             function = found.group("function")
     return {"error": error, "function": function}
 
+
+shutil.rmtree("__pycache__", ignore_errors=True)
 
 facts = run_json(PROBE)
 given = run_json(ANSWERS_PROBE)
