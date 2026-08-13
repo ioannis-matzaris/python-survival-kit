@@ -1,0 +1,4 @@
+# οι εξαρτήσεις του project, γραμμένες στο χέρι
+Requests
+tabulate
+PyYAML
