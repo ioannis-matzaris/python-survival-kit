@@ -8,7 +8,7 @@
 
 ## dependencies-constraints
 
-Το περιβάλλον του lab «Δες τι επιτρέπει ο περιορισμός που έγραψες», ανάμεσα στα
+Το περιβάλλον του lab «Υπολόγισε τι επιτρέπει ο περιορισμός σου», ανάμεσα στα
 μαθήματα του κεφαλαίου `dependencies`. Το `ekdoseis.json` είναι καταγεγραμμένη
 έξοδος του `pip index versions --pre` για τέσσερα πραγματικά packages
 (`requests`, `urllib3`, `tabulate`, `idna`), μαζί με τα pre-release τους. Το
