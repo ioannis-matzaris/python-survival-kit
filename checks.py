@@ -1,8 +1,7 @@
 """Ο βαθμολογητής του lab. Τρέξε: python3 checks.py
 
-Ξεκινάει ο ίδιος το service σου με uvicorn και το χτυπάει από έξω, όπως κάθε
-άλλος client. Δεν διαβάζει τον κώδικά σου, διαβάζει τις απαντήσεις του.
-Σταμάτα τον δικό σου uvicorn πριν το τρέξεις: η θύρα 8000 δεν χωράει δύο.
+Ξεκινάει ο ίδιος το service σου με uvicorn και το ρωτάει από έξω. Σταμάτα τον
+δικό σου uvicorn πριν το τρέξεις: η θύρα 8000 δεν χωράει δύο.
 """
 
 import json
@@ -36,7 +35,6 @@ def port_is_free() -> bool:
 
 
 def call(path: str) -> tuple[int, Any]:
-    """Επιστρέφει (status, σώμα). Status 0 σημαίνει ότι δεν απάντησε κανείς."""
     try:
         with urllib.request.urlopen(f"{BASE}{path}", timeout=5) as answer:
             raw = answer.read().decode("utf-8")
@@ -56,7 +54,7 @@ def wait_until_up(process: "subprocess.Popen[bytes]", seconds: float = 20.0) -> 
     while time.time() < deadline:
         if process.poll() is not None:
             return False
-        if call("/products")[0] != 0:
+        if call("/search")[0] != 0:
             return True
         time.sleep(0.2)
     return False
@@ -64,10 +62,6 @@ def wait_until_up(process: "subprocess.Popen[bytes]", seconds: float = 20.0) -> 
 
 def report(label: str, passed: bool) -> None:
     results.append((passed, label))
-
-
-def price_of(product: Any) -> Any:
-    return product.get("price") if isinstance(product, dict) else None
 
 
 if not (HERE / "main.py").exists():
@@ -88,48 +82,42 @@ service = subprocess.Popen(
 try:
     report("Το service ξεκινάει και απαντάει στο 8000", wait_until_up(service))
 
-    status, catalogue = call("/products")
+    status, everything = call("/search")
     report(
-        "Το GET /products επιστρέφει τα τρία προϊόντα",
-        status == 200 and isinstance(catalogue, list) and len(catalogue) == 3,
+        "Το GET /search χωρίς παράμετρο δίνει όλα τα προϊόντα",
+        status == 200 and isinstance(everything, list) and len(everything) == 4,
     )
 
-    status, one = call("/products/ZAX-1")
+    status, coffee = call("/search?q=%CE%BA%CE%B1%CF%86")
     report(
-        "Το GET /products/ZAX-1 επιστρέφει τη ζάχαρη",
-        status == 200 and isinstance(one, dict) and one.get("code") == "ZAX-1",
+        "Το GET /search?q=καφ κρατάει μόνο τους δύο καφέδες",
+        status == 200
+        and isinstance(coffee, list)
+        and sorted(item.get("code") for item in coffee) == ["KAF-250", "KAF-500"],
     )
 
+    status, cheap = call("/search?max_price=1.50")
     report(
-        "Η τιμή ταξιδεύει ως κείμενο με δύο δεκαδικά",
-        price_of(one) == "1.15",
-    )
-
-    if isinstance(catalogue, list):
-        prices = [price_of(item) for item in catalogue]
-    else:
-        prices = []
-    report(
-        "Καμία τιμή του καταλόγου δεν έγινε αριθμός",
-        len(prices) == 3 and all(isinstance(price, str) for price in prices),
-    )
-
-    status, missing = call("/products/DEN-YPARXEI")
-    report("Ένας άγνωστος κωδικός παίρνει 404", status == 404)
-
-    status, cheap = call("/products?max_price=1.50")
-    report(
-        "Το GET /products?max_price=1.50 αφήνει μόνο τη ζάχαρη",
+        "Το GET /search?max_price=1.50 κρατάει μόνο τη ζάχαρη",
         status == 200
         and isinstance(cheap, list)
         and [item.get("code") for item in cheap] == ["ZAX-1"],
     )
 
-    status, health = call("/health")
+    status, both = call("/search?q=%CE%BA%CE%B1%CF%86&max_price=4.00")
     report(
-        "Το GET /health απαντάει 200 με status ok",
-        status == 200 and isinstance(health, dict) and health.get("status") == "ok",
+        "Οι δύο παράμετροι μαζί αφήνουν μόνο τον espresso",
+        status == 200
+        and isinstance(both, list)
+        and [item.get("code") for item in both] == ["KAF-250"],
     )
+
+    status, price = call("/products/ZAX-1/price")
+    report(
+        "Το GET /products/ZAX-1/price δίνει την τιμή ως κείμενο",
+        status == 200 and isinstance(price, dict) and price.get("price") == "1.15",
+    )
+
 finally:
     service.terminate()
     try:
@@ -137,11 +125,11 @@ finally:
     except subprocess.TimeoutExpired:
         service.kill()
 
-total = len(results)
+total_checks = len(results)
 for index, (passed, label) in enumerate(results, start=1):
     mark = "✅" if passed else "❌"
-    print(f"[{index}/{total}] {label}".ljust(60) + f" {mark}")
+    print(f"[{index}/{total_checks}] {label}".ljust(60) + f" {mark}")
 
 score = sum(1 for passed, _ in results if passed)
 print()
-print(f"Σκορ: {score}/{total}")
+print(f"Σκορ: {score}/{total_checks}")
