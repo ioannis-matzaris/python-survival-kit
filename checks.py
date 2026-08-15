@@ -1,8 +1,8 @@
 """Ο βαθμολογητής του lab. Τρέξε: python3 checks.py
 
-Ξεκινάει ο ίδιος το service σου με uvicorn και το χτυπάει από έξω, όπως κάθε
-άλλος client. Δεν διαβάζει τον κώδικά σου, διαβάζει τις απαντήσεις του.
-Σταμάτα τον δικό σου uvicorn πριν το τρέξεις: η θύρα 8000 δεν χωράει δύο.
+Κάνει δύο πράγματα. Ξεκινάει το service σου και το ρωτάει από έξω, και μετά
+καλεί τις συναρτήσεις του pricing.py κατευθείαν, χωρίς κανένα HTTP. Το δεύτερο
+είναι όλο το νόημα του lab. Σταμάτα τον δικό σου uvicorn πριν το τρέξεις.
 """
 
 import json
@@ -36,7 +36,6 @@ def port_is_free() -> bool:
 
 
 def call(path: str) -> tuple[int, Any]:
-    """Επιστρέφει (status, σώμα). Status 0 σημαίνει ότι δεν απάντησε κανείς."""
     try:
         with urllib.request.urlopen(f"{BASE}{path}", timeout=5) as answer:
             raw = answer.read().decode("utf-8")
@@ -56,7 +55,7 @@ def wait_until_up(process: "subprocess.Popen[bytes]", seconds: float = 20.0) -> 
     while time.time() < deadline:
         if process.poll() is not None:
             return False
-        if call("/products")[0] != 0:
+        if call("/quote?kwh=1")[0] != 0:
             return True
         time.sleep(0.2)
     return False
@@ -64,10 +63,6 @@ def wait_until_up(process: "subprocess.Popen[bytes]", seconds: float = 20.0) -> 
 
 def report(label: str, passed: bool) -> None:
     results.append((passed, label))
-
-
-def price_of(product: Any) -> Any:
-    return product.get("price") if isinstance(product, dict) else None
 
 
 if not (HERE / "main.py").exists():
@@ -88,47 +83,16 @@ service = subprocess.Popen(
 try:
     report("Το service ξεκινάει και απαντάει στο 8000", wait_until_up(service))
 
-    status, catalogue = call("/products")
+    status, day = call("/quote?kwh=320")
     report(
-        "Το GET /products επιστρέφει τα τρία προϊόντα",
-        status == 200 and isinstance(catalogue, list) and len(catalogue) == 3,
+        "Το GET /quote?kwh=320 απαντάει 50.88",
+        status == 200 and isinstance(day, dict) and day.get("total") == "50.88",
     )
 
-    status, one = call("/products/ZAX-1")
+    status, night = call("/quote?kwh=320&tariff=night&vat=false")
     report(
-        "Το GET /products/ZAX-1 επιστρέφει τη ζάχαρη",
-        status == 200 and isinstance(one, dict) and one.get("code") == "ZAX-1",
-    )
-
-    report(
-        "Η τιμή ταξιδεύει ως κείμενο με δύο δεκαδικά",
-        price_of(one) == "1.15",
-    )
-
-    if isinstance(catalogue, list):
-        prices = [price_of(item) for item in catalogue]
-    else:
-        prices = []
-    report(
-        "Καμία τιμή του καταλόγου δεν έγινε αριθμός",
-        len(prices) == 3 and all(isinstance(price, str) for price in prices),
-    )
-
-    status, missing = call("/products/DEN-YPARXEI")
-    report("Ένας άγνωστος κωδικός παίρνει 404", status == 404)
-
-    status, cheap = call("/products?max_price=1.50")
-    report(
-        "Το GET /products?max_price=1.50 αφήνει μόνο τη ζάχαρη",
-        status == 200
-        and isinstance(cheap, list)
-        and [item.get("code") for item in cheap] == ["ZAX-1"],
-    )
-
-    status, health = call("/health")
-    report(
-        "Το GET /health απαντάει 200 με status ok",
-        status == 200 and isinstance(health, dict) and health.get("status") == "ok",
+        "Το νυχτερινό τιμολόγιο χωρίς ΦΠΑ απαντάει 25.60",
+        status == 200 and isinstance(night, dict) and night.get("total") == "25.60",
     )
 finally:
     service.terminate()
@@ -137,11 +101,65 @@ finally:
     except subprocess.TimeoutExpired:
         service.kill()
 
-total = len(results)
+report("Υπάρχει αρχείο pricing.py στη ρίζα", (HERE / "pricing.py").exists())
+
+WITHOUT_HTTP = """
+import sys
+from decimal import Decimal
+
+import pricing
+
+assert "fastapi" not in sys.modules, "το pricing.py έφερε μαζί του το FastAPI"
+assert pricing.energy_charge(320, "day") == Decimal("48.00")
+assert pricing.energy_charge(320, "night") == Decimal("25.60")
+assert pricing.with_vat(Decimal("48.00")) == Decimal("50.88")
+assert pricing.quote(320, "day", True) == Decimal("50.88")
+assert pricing.quote(320, "night", False) == Decimal("25.60")
+print("ok")
+"""
+
+direct = subprocess.run(
+    [sys.executable, "-c", WITHOUT_HTTP],
+    cwd=HERE,
+    capture_output=True,
+    text=True,
+)
+report(
+    "Οι συναρτήσεις του pricing.py δίνουν σωστά ποσά μόνες τους",
+    direct.returncode == 0,
+)
+NO_FASTAPI = """
+import sys
+
+import pricing
+
+assert "fastapi" not in sys.modules, "το pricing.py έφερε μαζί του το FastAPI"
+"""
+
+alone = subprocess.run(
+    [sys.executable, "-c", NO_FASTAPI],
+    cwd=HERE,
+    capture_output=True,
+    text=True,
+)
+report(
+    "Το pricing.py φορτώνει μόνο του, χωρίς το FastAPI",
+    alone.returncode == 0,
+)
+
+main_source = (HERE / "main.py").read_text(encoding="utf-8")
+report(
+    "Τα ποσοστά του τιμολογίου δεν έμειναν μέσα στο main.py",
+    "0.15" not in main_source
+    and "0.08" not in main_source
+    and "1.06" not in main_source,
+)
+
+total_checks = len(results)
 for index, (passed, label) in enumerate(results, start=1):
     mark = "✅" if passed else "❌"
-    print(f"[{index}/{total}] {label}".ljust(60) + f" {mark}")
+    print(f"[{index}/{total_checks}] {label}".ljust(62) + f" {mark}")
 
 score = sum(1 for passed, _ in results if passed)
 print()
-print(f"Σκορ: {score}/{total}")
+print(f"Σκορ: {score}/{total_checks}")
