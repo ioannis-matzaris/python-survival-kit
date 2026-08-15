@@ -1,22 +1,24 @@
 """Ο βαθμολογητής του lab. Τρέξε: python3 checks.py
 
-Ξεκινάει ο ίδιος το server.py σου σε δικό του process, του μιλάει με σκέτο
-socket όπως θα του μιλούσε ένας οποιοσδήποτε client, και κοιτάει τι γύρισε
-πίσω στο καλώδιο. Σταμάτα τον δικό σου server πριν το τρέξεις, αλλιώς η
-θύρα 8000 είναι πιασμένη.
+Ξεκινάει ο ίδιος το service σου με uvicorn και το χτυπάει από έξω, όπως κάθε
+άλλος client. Δεν διαβάζει τον κώδικά σου, διαβάζει τις απαντήσεις του.
+Σταμάτα τον δικό σου uvicorn πριν το τρέξεις: η θύρα 8000 δεν χωράει δύο.
 """
 
+import json
 import socket
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
+from typing import Any
 
 HERE = Path(__file__).resolve().parent
-SERVER = HERE / "server.py"
 HOST = "127.0.0.1"
 PORT = 8000
-BODY = "εντάξει"
+BASE = f"http://{HOST}:{PORT}"
 
 results: list[tuple[bool, str]] = []
 
@@ -33,129 +35,112 @@ def port_is_free() -> bool:
         probe.close()
 
 
-def ask(request: str, timeout: float = 3.0) -> str:
-    """Στέλνει ένα request με σκέτο socket. Κενό string σημαίνει καμία απάντηση."""
-    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    client.settimeout(timeout)
+def call(path: str) -> tuple[int, Any]:
+    """Επιστρέφει (status, σώμα). Status 0 σημαίνει ότι δεν απάντησε κανείς."""
     try:
-        client.connect((HOST, PORT))
-        client.sendall(request.encode("utf-8"))
-        chunks: list[bytes] = []
-        while True:
-            piece = client.recv(4096)
-            if not piece:
-                break
-            chunks.append(piece)
-        return b"".join(chunks).decode("utf-8", errors="replace")
-    except OSError:
-        return ""
-    finally:
-        client.close()
+        with urllib.request.urlopen(f"{BASE}{path}", timeout=5) as answer:
+            raw = answer.read().decode("utf-8")
+            return answer.status, json.loads(raw) if raw else None
+    except urllib.error.HTTPError as failure:
+        raw = failure.read().decode("utf-8")
+        try:
+            return failure.code, json.loads(raw) if raw else None
+        except json.JSONDecodeError:
+            return failure.code, raw
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+        return 0, None
 
 
-def get(path: str) -> str:
-    return ask(f"GET {path} HTTP/1.1\r\nHost: {HOST}:{PORT}\r\n\r\n")
-
-
-def header(raw: str, name: str) -> str:
-    for line in raw.replace("\r\n", "\n").split("\n"):
-        if line.lower().startswith(f"{name.lower()}:"):
-            return line.split(":", 1)[1].strip()
-    return ""
-
-
-def body_of(raw: str) -> str:
-    normalised = raw.replace("\r\n", "\n")
-    if "\n\n" not in normalised:
-        return ""
-    return normalised.split("\n\n", 1)[1]
-
-
-def first_response(process: subprocess.Popen[bytes], seconds: float = 5.0) -> str:
-    """Το πρώτο GET /health που παίρνει απάντηση.
-
-    Δοκιμάζει ξανά όσο η σύνδεση δεν περνάει, γιατί ο server θέλει λίγο για να
-    σηκωθεί. Δεν ανοίγει σύνδεση που δεν στέλνει request: ένας server που
-    απαντάει μία φορά και σταματάει πρέπει να τη δώσει αυτή τη μία εδώ.
-    """
+def wait_until_up(process: "subprocess.Popen[bytes]", seconds: float = 20.0) -> bool:
     deadline = time.time() + seconds
     while time.time() < deadline:
         if process.poll() is not None:
-            return ""
-        answer = get("/health")
-        if answer:
-            return answer
-        time.sleep(0.1)
-    return ""
+            return False
+        if call("/products")[0] != 0:
+            return True
+        time.sleep(0.2)
+    return False
 
 
 def report(label: str, passed: bool) -> None:
     results.append((passed, label))
 
 
-if not SERVER.exists():
-    print("Δεν βρήκα το server.py στη ρίζα του repo.")
+def price_of(product: Any) -> Any:
+    return product.get("price") if isinstance(product, dict) else None
+
+
+if not (HERE / "main.py").exists():
+    print("Δεν βρήκα το main.py στη ρίζα του repo.")
     sys.exit(1)
 
 if not port_is_free():
-    print(f"Η θύρα {PORT} είναι πιασμένη. Σταμάτα τον server σου και ξανατρέξε.")
+    print(f"Η θύρα {PORT} είναι πιασμένη. Σταμάτα το service σου και ξανατρέξε.")
     sys.exit(1)
 
-server_process = subprocess.Popen(
-    [sys.executable, str(SERVER)],
+service = subprocess.Popen(
+    [sys.executable, "-m", "uvicorn", "main:app", "--host", HOST, "--port", str(PORT)],
     cwd=HERE,
     stdout=subprocess.DEVNULL,
     stderr=subprocess.DEVNULL,
 )
 
 try:
-    first = first_response(server_process)
-    report("Το server.py ξεκινάει και απαντάει στο 8000", bool(first))
+    report("Το service ξεκινάει και απαντάει στο 8000", wait_until_up(service))
 
+    status, catalogue = call("/products")
     report(
-        "Το GET /health απαντάει 200 με σώμα «εντάξει»",
-        first.startswith("HTTP/1.1 200") and body_of(first) == BODY,
-    )
-    report(
-        "Το Content-Length μετράει bytes, όχι χαρακτήρες",
-        header(first, "Content-Length") == str(len(BODY.encode("utf-8"))),
-    )
-    report(
-        "Το Content-Type δηλώνει charset=utf-8",
-        "charset=utf-8" in header(first, "Content-Type").lower(),
-    )
-    report(
-        "Οι γραμμές της απάντησης χωρίζονται με \\r\\n",
-        bool(first) and "\r\n" in first and "\n" not in first.replace("\r\n", ""),
+        "Το GET /products επιστρέφει τα τρία προϊόντα",
+        status == 200 and isinstance(catalogue, list) and len(catalogue) == 3,
     )
 
-    unknown = get("/den-yparxei")
-    report("Μια άγνωστη διαδρομή παίρνει 404", unknown.startswith("HTTP/1.1 404"))
-
-    second = get("/health")
-    third = get("/health")
+    status, one = call("/products/ZAX-1")
     report(
-        "Ο server απαντάει και στο δεύτερο και στο τρίτο request",
-        second.startswith("HTTP/1.1 200") and third.startswith("HTTP/1.1 200"),
+        "Το GET /products/ZAX-1 επιστρέφει τη ζάχαρη",
+        status == 200 and isinstance(one, dict) and one.get("code") == "ZAX-1",
     )
 
-    ask("ΣΚΟΥΠΙΔΙΑ\r\n\r\n")
-    after = get("/health")
     report(
-        "Ένα χαλασμένο request δεν ρίχνει τον server",
-        server_process.poll() is None and after.startswith("HTTP/1.1 200"),
+        "Η τιμή ταξιδεύει ως κείμενο με δύο δεκαδικά",
+        price_of(one) == "1.15",
+    )
+
+    if isinstance(catalogue, list):
+        prices = [price_of(item) for item in catalogue]
+    else:
+        prices = []
+    report(
+        "Καμία τιμή του καταλόγου δεν έγινε αριθμός",
+        len(prices) == 3 and all(isinstance(price, str) for price in prices),
+    )
+
+    status, missing = call("/products/DEN-YPARXEI")
+    report("Ένας άγνωστος κωδικός παίρνει 404", status == 404)
+
+    status, cheap = call("/products?max_price=1.50")
+    report(
+        "Το GET /products?max_price=1.50 αφήνει μόνο τη ζάχαρη",
+        status == 200
+        and isinstance(cheap, list)
+        and [item.get("code") for item in cheap] == ["ZAX-1"],
+    )
+
+    status, health = call("/health")
+    report(
+        "Το GET /health απαντάει 200 με status ok",
+        status == 200 and isinstance(health, dict) and health.get("status") == "ok",
     )
 finally:
-    server_process.terminate()
+    service.terminate()
     try:
-        server_process.wait(timeout=3)
+        service.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        server_process.kill()
+        service.kill()
 
 total = len(results)
 for index, (passed, label) in enumerate(results, start=1):
     mark = "✅" if passed else "❌"
-    print(f"[{index}/{total}] {label}".ljust(62) + f" {mark}")
+    print(f"[{index}/{total}] {label}".ljust(60) + f" {mark}")
 
 score = sum(1 for passed, _ in results if passed)
 print()
