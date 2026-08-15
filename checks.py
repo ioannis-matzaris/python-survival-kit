@@ -1,8 +1,7 @@
 """Ο βαθμολογητής του lab. Τρέξε: python3 checks.py
 
-Ξεκινάει ο ίδιος το service σου με uvicorn και το χτυπάει από έξω, όπως κάθε
-άλλος client. Δεν διαβάζει τον κώδικά σου, διαβάζει τις απαντήσεις του.
-Σταμάτα τον δικό σου uvicorn πριν το τρέξεις: η θύρα 8000 δεν χωράει δύο.
+Δεν κοιτάει σχεδόν καθόλου τα σώματα των απαντήσεων. Κοιτάει τους αριθμούς
+και μία επικεφαλίδα. Σταμάτα τον δικό σου uvicorn πριν το τρέξεις.
 """
 
 import json
@@ -35,20 +34,29 @@ def port_is_free() -> bool:
         probe.close()
 
 
-def call(path: str) -> tuple[int, Any]:
-    """Επιστρέφει (status, σώμα). Status 0 σημαίνει ότι δεν απάντησε κανείς."""
+def send(path: str, payload: Any = None) -> tuple[int, Any, dict[str, str]]:
+    """Επιστρέφει (status, σώμα, επικεφαλίδες). Status 0 σημαίνει καμία απάντηση."""
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        f"{BASE}{path}",
+        data=data,
+        headers={"Content-Type": "application/json"} if data else {},
+        method="POST" if data else "GET",
+    )
     try:
-        with urllib.request.urlopen(f"{BASE}{path}", timeout=5) as answer:
+        with urllib.request.urlopen(request, timeout=5) as answer:
             raw = answer.read().decode("utf-8")
-            return answer.status, json.loads(raw) if raw else None
+            headers = {key.lower(): value for key, value in answer.headers.items()}
+            return answer.status, json.loads(raw) if raw else None, headers
     except urllib.error.HTTPError as failure:
         raw = failure.read().decode("utf-8")
+        headers = {key.lower(): value for key, value in failure.headers.items()}
         try:
-            return failure.code, json.loads(raw) if raw else None
+            return failure.code, json.loads(raw) if raw else None, headers
         except json.JSONDecodeError:
-            return failure.code, raw
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
-        return 0, None
+            return failure.code, raw, headers
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return 0, None, {}
 
 
 def wait_until_up(process: "subprocess.Popen[bytes]", seconds: float = 20.0) -> bool:
@@ -56,7 +64,7 @@ def wait_until_up(process: "subprocess.Popen[bytes]", seconds: float = 20.0) -> 
     while time.time() < deadline:
         if process.poll() is not None:
             return False
-        if call("/products")[0] != 0:
+        if send("/orders/PAR-1001")[0] != 0:
             return True
         time.sleep(0.2)
     return False
@@ -64,10 +72,6 @@ def wait_until_up(process: "subprocess.Popen[bytes]", seconds: float = 20.0) -> 
 
 def report(label: str, passed: bool) -> None:
     results.append((passed, label))
-
-
-def price_of(product: Any) -> Any:
-    return product.get("price") if isinstance(product, dict) else None
 
 
 if not (HERE / "main.py").exists():
@@ -88,48 +92,33 @@ service = subprocess.Popen(
 try:
     report("Το service ξεκινάει και απαντάει στο 8000", wait_until_up(service))
 
-    status, catalogue = call("/products")
+    status, order, _ = send("/orders/PAR-1001")
     report(
-        "Το GET /products επιστρέφει τα τρία προϊόντα",
-        status == 200 and isinstance(catalogue, list) and len(catalogue) == 3,
+        "Υπαρκτή παραγγελία δίνει 200",
+        status == 200 and isinstance(order, dict) and order.get("customer") == "maria",
     )
 
-    status, one = call("/products/ZAX-1")
+    status, _, _ = send("/orders/PAR-9999")
+    report("Ανύπαρκτη παραγγελία δίνει 404", status == 404)
+
+    status, empty, _ = send("/orders?customer=kanenas")
     report(
-        "Το GET /products/ZAX-1 επιστρέφει τη ζάχαρη",
-        status == 200 and isinstance(one, dict) and one.get("code") == "ZAX-1",
+        "Αναζήτηση χωρίς αποτελέσματα δίνει 200 με άδεια λίστα",
+        status == 200 and empty == [],
     )
 
+    status, _, headers = send("/orders", {"reference": "PAR-2001", "customer": "eleni"})
+    report("Νέα παραγγελία δίνει 201", status == 201)
     report(
-        "Η τιμή ταξιδεύει ως κείμενο με δύο δεκαδικά",
-        price_of(one) == "1.15",
+        "Η απάντηση του 201 δείχνει πού βρίσκεται η παραγγελία",
+        headers.get("location") == "/orders/PAR-2001",
     )
 
-    if isinstance(catalogue, list):
-        prices = [price_of(item) for item in catalogue]
-    else:
-        prices = []
-    report(
-        "Καμία τιμή του καταλόγου δεν έγινε αριθμός",
-        len(prices) == 3 and all(isinstance(price, str) for price in prices),
-    )
+    status, _, _ = send("/orders", {"reference": "PAR-2001", "customer": "eleni"})
+    report("Ο ίδιος κωδικός δεύτερη φορά δίνει 409", status == 409)
 
-    status, missing = call("/products/DEN-YPARXEI")
-    report("Ένας άγνωστος κωδικός παίρνει 404", status == 404)
-
-    status, cheap = call("/products?max_price=1.50")
-    report(
-        "Το GET /products?max_price=1.50 αφήνει μόνο τη ζάχαρη",
-        status == 200
-        and isinstance(cheap, list)
-        and [item.get("code") for item in cheap] == ["ZAX-1"],
-    )
-
-    status, health = call("/health")
-    report(
-        "Το GET /health απαντάει 200 με status ok",
-        status == 200 and isinstance(health, dict) and health.get("status") == "ok",
-    )
+    status, _, _ = send("/orders", {"reference": "PA", "customer": "eleni"})
+    report("Σώμα που δεν περνάει το schema δίνει 422", status == 422)
 finally:
     service.terminate()
     try:
@@ -137,11 +126,11 @@ finally:
     except subprocess.TimeoutExpired:
         service.kill()
 
-total = len(results)
+total_checks = len(results)
 for index, (passed, label) in enumerate(results, start=1):
     mark = "✅" if passed else "❌"
-    print(f"[{index}/{total}] {label}".ljust(60) + f" {mark}")
+    print(f"[{index}/{total_checks}] {label}".ljust(62) + f" {mark}")
 
 score = sum(1 for passed, _ in results if passed)
 print()
-print(f"Σκορ: {score}/{total}")
+print(f"Σκορ: {score}/{total_checks}")
