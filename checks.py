@@ -1,8 +1,8 @@
 """Ο βαθμολογητής του lab. Τρέξε: python3 checks.py
 
-Ξεκινάει ο ίδιος το service σου με uvicorn και το χτυπάει από έξω, όπως κάθε
-άλλος client. Δεν διαβάζει τον κώδικά σου, διαβάζει τις απαντήσεις του.
-Σταμάτα τον δικό σου uvicorn πριν το τρέξεις: η θύρα 8000 δεν χωράει δύο.
+Ρωτάει το service σου με σωστά και με λάθος αιτήματα, και κοιτάει τρία
+πράγματα: τον αριθμό, το σχήμα του σώματος, και τι αποκαλύπτει όταν σκάσει.
+Σταμάτα τον δικό σου uvicorn πριν το τρέξεις.
 """
 
 import json
@@ -35,20 +35,29 @@ def port_is_free() -> bool:
         probe.close()
 
 
-def call(path: str) -> tuple[int, Any]:
-    """Επιστρέφει (status, σώμα). Status 0 σημαίνει ότι δεν απάντησε κανείς."""
+def send(path: str, payload: Any = None) -> tuple[int, Any, dict[str, str]]:
+    """Επιστρέφει (status, σώμα, επικεφαλίδες). Status 0 σημαίνει καμία απάντηση."""
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        f"{BASE}{path}",
+        data=data,
+        headers={"Content-Type": "application/json"} if data else {},
+        method="POST" if data else "GET",
+    )
     try:
-        with urllib.request.urlopen(f"{BASE}{path}", timeout=5) as answer:
+        with urllib.request.urlopen(request, timeout=5) as answer:
             raw = answer.read().decode("utf-8")
-            return answer.status, json.loads(raw) if raw else None
+            headers = {key.lower(): value for key, value in answer.headers.items()}
+            return answer.status, json.loads(raw) if raw else None, headers
     except urllib.error.HTTPError as failure:
         raw = failure.read().decode("utf-8")
+        headers = {key.lower(): value for key, value in failure.headers.items()}
         try:
-            return failure.code, json.loads(raw) if raw else None
+            return failure.code, json.loads(raw) if raw else None, headers
         except json.JSONDecodeError:
-            return failure.code, raw
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
-        return 0, None
+            return failure.code, raw, headers
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return 0, None, {}
 
 
 def wait_until_up(process: "subprocess.Popen[bytes]", seconds: float = 20.0) -> bool:
@@ -56,7 +65,7 @@ def wait_until_up(process: "subprocess.Popen[bytes]", seconds: float = 20.0) -> 
     while time.time() < deadline:
         if process.poll() is not None:
             return False
-        if call("/products")[0] != 0:
+        if send("/workshops/PY-101")[0] != 0:
             return True
         time.sleep(0.2)
     return False
@@ -64,10 +73,6 @@ def wait_until_up(process: "subprocess.Popen[bytes]", seconds: float = 20.0) -> 
 
 def report(label: str, passed: bool) -> None:
     results.append((passed, label))
-
-
-def price_of(product: Any) -> Any:
-    return product.get("price") if isinstance(product, dict) else None
 
 
 if not (HERE / "main.py").exists():
@@ -88,47 +93,42 @@ service = subprocess.Popen(
 try:
     report("Το service ξεκινάει και απαντάει στο 8000", wait_until_up(service))
 
-    status, catalogue = call("/products")
+    status, workshop, _ = send("/workshops/PY-101")
     report(
-        "Το GET /products επιστρέφει τα τρία προϊόντα",
-        status == 200 and isinstance(catalogue, list) and len(catalogue) == 3,
+        "Υπαρκτό σεμινάριο δίνει 200",
+        status == 200 and isinstance(workshop, dict) and workshop.get("seats") == 2,
     )
 
-    status, one = call("/products/ZAX-1")
+    status, missing, _ = send("/workshops/DEN-YPARXEI")
+    report("Ανύπαρκτο σεμινάριο δίνει 404", status == 404)
     report(
-        "Το GET /products/ZAX-1 επιστρέφει τη ζάχαρη",
-        status == 200 and isinstance(one, dict) and one.get("code") == "ZAX-1",
+        "Το σώμα του λάθους έχει code και message στο πρώτο επίπεδο",
+        isinstance(missing, dict)
+        and missing.get("code") == "unknown_workshop"
+        and isinstance(missing.get("message"), str)
+        and missing.get("message") != "",
     )
 
+    status, _, _ = send("/bookings", {"code": "PY-101", "email": "maria@example.gr"})
+    report("Νέα κράτηση δίνει 201", status == 201)
+
+    status, again, _ = send("/bookings", {"code": "PY-101", "email": "maria@example.gr"})
     report(
-        "Η τιμή ταξιδεύει ως κείμενο με δύο δεκαδικά",
-        price_of(one) == "1.15",
+        "Δεύτερη κράτηση του ίδιου δίνει 409 με code duplicate_booking",
+        status == 409 and isinstance(again, dict) and again.get("code") == "duplicate_booking",
     )
 
-    if isinstance(catalogue, list):
-        prices = [price_of(item) for item in catalogue]
-    else:
-        prices = []
+    status, full, _ = send("/bookings", {"code": "API-201", "email": "giorgos@example.gr"})
     report(
-        "Καμία τιμή του καταλόγου δεν έγινε αριθμός",
-        len(prices) == 3 and all(isinstance(price, str) for price in prices),
+        "Κράτηση σε πλήρες σεμινάριο δίνει 409 με code sold_out",
+        status == 409 and isinstance(full, dict) and full.get("code") == "sold_out",
     )
 
-    status, missing = call("/products/DEN-YPARXEI")
-    report("Ένας άγνωστος κωδικός παίρνει 404", status == 404)
-
-    status, cheap = call("/products?max_price=1.50")
+    status, boom, _ = send("/workshops/API-201/attendance")
+    leaked = json.dumps(boom, ensure_ascii=False) if boom is not None else ""
     report(
-        "Το GET /products?max_price=1.50 αφήνει μόνο τη ζάχαρη",
-        status == 200
-        and isinstance(cheap, list)
-        and [item.get("code") for item in cheap] == ["ZAX-1"],
-    )
-
-    status, health = call("/health")
-    report(
-        "Το GET /health απαντάει 200 με status ok",
-        status == 200 and isinstance(health, dict) and health.get("status") == "ok",
+        "Ένα δικό σου bug δίνει 500 χωρίς να αποκαλύπτει το σφάλμα",
+        status == 500 and "division" not in leaked and "zero" not in leaked.lower(),
     )
 finally:
     service.terminate()
@@ -137,11 +137,11 @@ finally:
     except subprocess.TimeoutExpired:
         service.kill()
 
-total = len(results)
+total_checks = len(results)
 for index, (passed, label) in enumerate(results, start=1):
     mark = "✅" if passed else "❌"
-    print(f"[{index}/{total}] {label}".ljust(60) + f" {mark}")
+    print(f"[{index}/{total_checks}] {label}".ljust(62) + f" {mark}")
 
 score = sum(1 for passed, _ in results if passed)
 print()
-print(f"Σκορ: {score}/{total}")
+print(f"Σκορ: {score}/{total_checks}")
