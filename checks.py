@@ -92,6 +92,7 @@ report(
     attempt(lambda: users.login(connection, "kanenas@example.gr", "kalimera123"), True) is False,
 )
 
+
 def refuses_long_password() -> bool:
     """Θέλουμε δικό σου ValueError με ελληνικό μήνυμα, όχι το σφάλμα της bcrypt."""
     try:
