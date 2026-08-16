@@ -1,51 +1,45 @@
-"""Φτιάχνει το shop.db με μισό εκατομμύριο παραγγελίες.
-
-Τρέξε: python3 seed.py
-
-Θέλει λίγα δευτερόλεπτα και γύρω στα 40 MB στον δίσκο.
-"""
+"""Φτιάχνει το shop.db από το μηδέν. Τρέξε: python3 seed.py"""
 
 import random
-import sqlite3
-from datetime import date, timedelta
 from pathlib import Path
+
+from sqlalchemy.orm import Session
+
+from models import Base, Customer, Order, OrderLine, Product
+from shop import engine
 
 HERE = Path(__file__).resolve().parent
 DB = HERE / "shop.db"
-ORDERS = 2_000_000
-START = date(2024, 1, 1)
 
 if DB.exists():
     DB.unlink()
 
-connection = sqlite3.connect(DB)
-connection.executescript(
-    """
-    CREATE TABLE orders (
-        reference TEXT PRIMARY KEY,
-        customer_id INTEGER NOT NULL,
-        created TEXT NOT NULL,
-        total_cents INTEGER NOT NULL
-    );
-    """
-)
+Base.metadata.create_all(engine)
 
-generator = random.Random(20260815)
+generator = random.Random(20260816)
 
+with Session(engine) as session:
+    customers = [
+        Customer(name=f"Πελάτης {number}", email=f"customer{number}@example.gr")
+        for number in range(1, 41)
+    ]
+    products = [
+        Product(code=f"PRO-{number:03d}", price_cents=generator.randrange(200, 9000), stock=500)
+        for number in range(1, 21)
+    ]
+    session.add_all(customers + products)
+    session.flush()
 
-def rows():
-    for number in range(ORDERS):
-        day = START + timedelta(days=generator.randrange(1000))
-        yield (
-            f"PAR-{number:07d}",
-            generator.randrange(1, 5000),
-            day.isoformat(),
-            generator.randrange(500, 40000),
+    for number in range(200):
+        month = generator.choice(["2026-06", "2026-07", "2026-08"])
+        day = generator.randrange(1, 29)
+        session.add(
+            Order(
+                customer_id=generator.choice(customers).id,
+                created=f"{month}-{day:02d}",
+                total_cents=generator.randrange(500, 40000),
+            )
         )
+    session.commit()
 
-
-connection.executemany("INSERT INTO orders VALUES (?, ?, ?, ?)", rows())
-connection.commit()
-connection.close()
-
-print(f"Έτοιμο: {DB.name} με {ORDERS} παραγγελίες")
+print(f"Έτοιμο: {DB.name} με 40 πελάτες, 20 προϊόντα και 200 παραγγελίες")

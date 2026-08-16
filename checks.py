@@ -1,19 +1,20 @@
 """Ο βαθμολογητής του lab. Τρέξε: python3 checks.py
 
-Καλεί τη july_total, κρατάει το SQL που έστειλε στη βάση, το περνάει από
-EXPLAIN QUERY PLAN και μετράει χρόνο. Δεν κοιτάει πώς το έγραψες, κοιτάει τι
-έκανε η βάση.
+Καλεί τις τρεις συναρτήσεις σου, μετράει πόσα ερωτήματα έστειλαν στη βάση, και
+κοιτάει τι έμεινε πίσω όταν κάτι πήγε στραβά. Φτιάχνει δική του βάση κάθε φορά,
+οπότε δεν χαλάει το shop.db σου.
 """
 
-import sqlite3
+import shutil
 import sys
-import time
 from pathlib import Path
 
+from sqlalchemy import create_engine, event, func, select
+from sqlalchemy.orm import Session
+
 HERE = Path(__file__).resolve().parent
-DB = HERE / "shop.db"
-JULY_TOTAL = 1245524500
-BUDGET_MS = 20.0
+SOURCE = HERE / "shop.db"
+COPY = HERE / "checks.db"
 
 results: list[tuple[bool, str]] = []
 statements: list[str] = []
@@ -23,65 +24,100 @@ def report(label: str, passed: bool) -> None:
     results.append((passed, label))
 
 
-if not DB.exists():
+if not SOURCE.exists():
     print("Δεν βρήκα το shop.db. Τρέξε πρώτα: python3 seed.py")
     sys.exit(1)
 
 try:
-    import report as student
+    import shop
+    from models import Order, OrderLine, Product
 except Exception as error:
-    print(f"Το report.py δεν φορτώνει: {error}")
+    print(f"Το shop.py δεν φορτώνει: {error}")
     sys.exit(1)
 
-connection = sqlite3.connect(DB)
-connection.set_trace_callback(statements.append)
+shutil.copy(SOURCE, COPY)
+engine = create_engine(f"sqlite:///{COPY}")
 
-connection.execute("SELECT 1").fetchone()
-started = time.perf_counter()
-answer = student.july_total(connection)
-elapsed_ms = (time.perf_counter() - started) * 1000
 
-connection.set_trace_callback(None)
+@event.listens_for(engine, "before_cursor_execute")
+def record(conn, cursor, statement, parameters, context, executemany):
+    statements.append(statement)
 
-report(f"Το σύνολο του Ιουλίου βγαίνει {JULY_TOTAL} λεπτά", answer == JULY_TOTAL)
 
-indexes = connection.execute(
-    "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'orders' AND sql IS NOT NULL"
-).fetchall()
-index_sql = " ".join(row[0] for row in indexes).lower()
-report("Υπάρχει δείκτης πάνω στη στήλη created", "created" in index_sql)
+with Session(engine) as session:
+    product = session.scalars(select(Product)).first()
+    product.stock = 3
+    session.commit()
 
-selects = [one for one in statements if one.strip().lower().startswith("select")]
-query = selects[-1] if selects else ""
-
-plan = ""
-if query:
+    statements.clear()
+    order_id = None
     try:
-        rows = connection.execute("EXPLAIN QUERY PLAN " + query).fetchall()
-        plan = " ".join(str(row[-1]) for row in rows)
-    except sqlite3.Error as error:
-        plan = f"σφάλμα: {error}"
+        order_id = shop.place_order(session, 1, {product.code: 2})
+    except Exception as error:
+        order_id = f"σφάλμα: {error}"
 
-report("Το ερώτημα ψάχνει, δεν σαρώνει τον πίνακα", "SEARCH" in plan)
+    lines = session.scalars(select(OrderLine).where(OrderLine.order_id == order_id)).all()
+    order = session.get(Order, order_id) if isinstance(order_id, int) else None
+    report(
+        "Μια κανονική παραγγελία γράφεται με τη γραμμή της και σωστό σύνολο",
+        order is not None and len(lines) == 1 and order.total_cents == lines[0].price_cents * 2,
+    )
 
-report(
-    "Καμία συνάρτηση δεν μπαίνει πάνω στη στήλη created",
-    bool(query) and "substr" not in query.lower() and "strftime" not in query.lower(),
-)
+with Session(engine) as session:
+    product = session.scalars(select(Product)).first()
+    before_stock = product.stock
+    before_orders = len(session.scalars(select(Order)).all())
+    before_lines = len(session.scalars(select(OrderLine)).all())
 
-report(
-    "Ο δείκτης απαντάει χωρίς να ανοίξει τον πίνακα",
-    "COVERING INDEX" in plan,
-)
+    second = session.scalars(select(Product)).all()[1]
+    try:
+        shop.place_order(session, 1, {product.code: 1, second.code: 10_000})
+    except Exception:
+        session.rollback()
 
-report(f"Η αναφορά τελειώνει κάτω από {BUDGET_MS:.0f} ms ({elapsed_ms:.1f})", elapsed_ms < BUDGET_MS)
+    after_orders = len(session.scalars(select(Order)).all())
+    after_lines = len(session.scalars(select(OrderLine)).all())
+    after_stock = session.scalars(select(Product)).first().stock
 
-connection.close()
+    report("Παραγγελία που σκάει στη μέση δεν αφήνει παραγγελία πίσω", after_orders == before_orders)
+    report("Ούτε γραμμές παραγγελίας", after_lines == before_lines)
+    report("Ούτε πειραγμένο απόθεμα", after_stock == before_stock)
+
+with Session(engine) as session:
+    how_many = len(session.scalars(select(Order)).all())
+    statements.clear()
+    pairs = shop.orders_with_customer(session)
+    queries = len(statements)
+    report(
+        "Η orders_with_customer δίνει ένα ζεύγος ανά παραγγελία, με όνομα",
+        len(pairs) == how_many and all(isinstance(one[1], str) and one[1] for one in pairs),
+    )
+    report(
+        f"Και τα φέρνει με λίγα ερωτήματα, όχι ένα ανά παραγγελία ({queries})",
+        queries <= 3,
+    )
+
+with Session(engine) as session:
+    statements.clear()
+    total = shop.month_total(session, "2026-07")
+    expected = session.scalar(
+        select(func.sum(Order.total_cents)).where(
+            Order.created >= "2026-07-01", Order.created < "2026-08-01"
+        )
+    )
+    month_sql = " ".join(statements).lower()
+    report("Το month_total(2026-07) δίνει το σωστό σύνολο", total == expected)
+    report(
+        "Και το ρωτάει χωρίς συνάρτηση πάνω στη στήλη created",
+        "substr" not in month_sql and "strftime" not in month_sql,
+    )
+
+COPY.unlink(missing_ok=True)
 
 total_checks = len(results)
 for index, (passed, label) in enumerate(results, start=1):
     mark = "✅" if passed else "❌"
-    print(f"[{index}/{total_checks}] {label}".ljust(64) + f" {mark}")
+    print(f"[{index}/{total_checks}] {label}".ljust(66) + f" {mark}")
 
 score = sum(1 for passed, _ in results if passed)
 print()
