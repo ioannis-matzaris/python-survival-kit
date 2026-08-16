@@ -1,123 +1,121 @@
 """Ο βαθμολογητής του lab. Τρέξε: python3 checks.py
 
-Καλεί τις τρεις συναρτήσεις σου, μετράει πόσα ερωτήματα έστειλαν στη βάση, και
-κοιτάει τι έμεινε πίσω όταν κάτι πήγε στραβά. Φτιάχνει δική του βάση κάθε φορά,
-οπότε δεν χαλάει το shop.db σου.
+Δουλεύει πάνω σε αντίγραφο της βάσης, καλεί τις δικές σου register και login,
+και μετά ανοίγει τη βάση και κοιτάει τι έγραψες μέσα.
 """
 
 import shutil
+import sqlite3
 import sys
 from pathlib import Path
 
-from sqlalchemy import create_engine, event, func, select
-from sqlalchemy.orm import Session
-
 HERE = Path(__file__).resolve().parent
-SOURCE = HERE / "shop.db"
+SOURCE = HERE / "users.db"
 COPY = HERE / "checks.db"
+LONG_GREEK = "Το σπίτι μου στη Θεσσαλονίκη έχει μπλε παράθυρα και κόκκινη πόρτα"
 
 results: list[tuple[bool, str]] = []
-statements: list[str] = []
 
 
 def report(label: str, passed: bool) -> None:
     results.append((passed, label))
 
 
+def attempt(call, fallback=None):
+    try:
+        return call()
+    except Exception as error:
+        return f"σφάλμα: {error}" if fallback is None else fallback
+
+
 if not SOURCE.exists():
-    print("Δεν βρήκα το shop.db. Τρέξε πρώτα: python3 seed.py")
+    print("Δεν βρήκα το users.db. Τρέξε πρώτα: python3 seed.py")
     sys.exit(1)
 
 try:
-    import shop
-    from models import Order, OrderLine, Product
+    import users
 except Exception as error:
-    print(f"Το shop.py δεν φορτώνει: {error}")
+    print(f"Το users.py δεν φορτώνει: {error}")
     sys.exit(1)
 
 shutil.copy(SOURCE, COPY)
-engine = create_engine(f"sqlite:///{COPY}")
+connection = sqlite3.connect(COPY)
 
+migrated = attempt(lambda: users.migrate_plaintext(connection), "λείπει")
 
-@event.listens_for(engine, "before_cursor_execute")
-def record(conn, cursor, statement, parameters, context, executemany):
-    statements.append(statement)
+first = attempt(lambda: users.register(connection, "nikos@example.gr", "kalimera123"))
+second = attempt(lambda: users.register(connection, "sofia@example.gr", "kalimera123"))
 
+stored = {
+    row[0]: row[1]
+    for row in connection.execute("SELECT email, password FROM users").fetchall()
+}
 
-with Session(engine) as session:
-    product = session.scalars(select(Product)).first()
-    product.stock = 3
-    session.commit()
+report(
+    "Υπάρχει migrate_plaintext και τρέχει χωρίς σφάλμα",
+    migrated != "λείπει" and not str(migrated).startswith("σφάλμα:"),
+)
 
-    statements.clear()
-    order_id = None
+report(
+    "Κανένας κωδικός δεν είναι αποθηκευμένος σε καθαρό κείμενο",
+    "kalimera123" not in stored.values() and "Th3sSal0niki!" not in stored.values(),
+)
+
+new_secrets = [stored.get("nikos@example.gr", ""), stored.get("sofia@example.gr", "")]
+report(
+    "Ό,τι αποθηκεύεις μοιάζει με bcrypt hash",
+    all(isinstance(one, str) and one.startswith("$2") and len(one) >= 59 for one in new_secrets),
+)
+
+report(
+    "Δύο χρήστες με τον ίδιο κωδικό δεν έχουν το ίδιο αποθηκευμένο",
+    new_secrets[0] != new_secrets[1] and all(new_secrets),
+)
+
+report(
+    "Σωστός κωδικός περνάει το login",
+    attempt(lambda: users.login(connection, "nikos@example.gr", "kalimera123"), False) is True,
+)
+
+report(
+    "Λάθος κωδικός δεν περνάει",
+    attempt(lambda: users.login(connection, "nikos@example.gr", "kalimera124"), True) is False,
+)
+
+report(
+    "Ο κωδικός του ενός δεν ανοίγει τον λογαριασμό του άλλου",
+    attempt(lambda: users.login(connection, "eleni@example.gr", "kalimera123"), True) is False,
+)
+
+report(
+    "Ανύπαρκτο email δεν περνάει και δεν ρίχνει το πρόγραμμα",
+    attempt(lambda: users.login(connection, "kanenas@example.gr", "kalimera123"), True) is False,
+)
+
+def refuses_long_password() -> bool:
+    """Θέλουμε δικό σου ValueError με ελληνικό μήνυμα, όχι το σφάλμα της bcrypt."""
     try:
-        order_id = shop.place_order(session, 1, {product.code: 2})
-    except Exception as error:
-        order_id = f"σφάλμα: {error}"
-
-    lines = session.scalars(select(OrderLine).where(OrderLine.order_id == order_id)).all()
-    order = session.get(Order, order_id) if isinstance(order_id, int) else None
-    report(
-        "Μια κανονική παραγγελία γράφεται με τη γραμμή της και σωστό σύνολο",
-        order is not None and len(lines) == 1 and order.total_cents == lines[0].price_cents * 2,
-    )
-
-with Session(engine) as session:
-    product = session.scalars(select(Product)).first()
-    before_stock = product.stock
-    before_orders = len(session.scalars(select(Order)).all())
-    before_lines = len(session.scalars(select(OrderLine)).all())
-
-    second = session.scalars(select(Product)).all()[1]
-    try:
-        shop.place_order(session, 1, {product.code: 1, second.code: 10_000})
+        users.register(connection, "long@example.gr", LONG_GREEK)
+    except ValueError as error:
+        message = str(error)
+        return any("Α" <= letter <= "ω" for letter in message) and "72" not in message
     except Exception:
-        session.rollback()
+        return False
+    return False
 
-    after_orders = len(session.scalars(select(Order)).all())
-    after_lines = len(session.scalars(select(OrderLine)).all())
-    after_stock = session.scalars(select(Product)).first().stock
 
-    report("Παραγγελία που σκάει στη μέση δεν αφήνει παραγγελία πίσω", after_orders == before_orders)
-    report("Ούτε γραμμές παραγγελίας", after_lines == before_lines)
-    report("Ούτε πειραγμένο απόθεμα", after_stock == before_stock)
+report(
+    f"Passphrase {len(LONG_GREEK.encode('utf-8'))} bytes απορρίπτεται με δικό σου μήνυμα",
+    refuses_long_password(),
+)
 
-with Session(engine) as session:
-    how_many = len(session.scalars(select(Order)).all())
-    statements.clear()
-    pairs = shop.orders_with_customer(session)
-    queries = len(statements)
-    report(
-        "Η orders_with_customer δίνει ένα ζεύγος ανά παραγγελία, με όνομα",
-        len(pairs) == how_many and all(isinstance(one[1], str) and one[1] for one in pairs),
-    )
-    report(
-        f"Και τα φέρνει με λίγα ερωτήματα, όχι ένα ανά παραγγελία ({queries})",
-        queries <= 3,
-    )
-
-with Session(engine) as session:
-    statements.clear()
-    total = shop.month_total(session, "2026-07")
-    expected = session.scalar(
-        select(func.sum(Order.total_cents)).where(
-            Order.created >= "2026-07-01", Order.created < "2026-08-01"
-        )
-    )
-    month_sql = " ".join(statements).lower()
-    report("Το month_total(2026-07) δίνει το σωστό σύνολο", total == expected)
-    report(
-        "Και το ρωτάει χωρίς συνάρτηση πάνω στη στήλη created",
-        "substr" not in month_sql and "strftime" not in month_sql,
-    )
-
+connection.close()
 COPY.unlink(missing_ok=True)
 
 total_checks = len(results)
 for index, (passed, label) in enumerate(results, start=1):
     mark = "✅" if passed else "❌"
-    print(f"[{index}/{total_checks}] {label}".ljust(66) + f" {mark}")
+    print(f"[{index}/{total_checks}] {label}".ljust(72) + f" {mark}")
 
 score = sum(1 for passed, _ in results if passed)
 print()
