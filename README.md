@@ -6,19 +6,19 @@
 αυτό το repo με το χέρι: το lab κάθε κεφαλαίου έχει ένα κουμπί που σου φτιάχνει
 ένα Codespace στο σωστό branch, με το περιβάλλον ήδη στημένο.
 
-## auth-and-security-passwords
+## auth-and-security-token-check
 
-Ένα ενδιάμεσο lab του κεφαλαίου `auth-and-security`. Η εγγραφή και η σύνδεση
-δουλεύουν, και ο κωδικός του καθενός είναι διαβάσιμος από όποιον ανοίξει τη
-βάση.
+Ένα ενδιάμεσο lab του κεφαλαίου `auth-and-security`. Το service διαβάζει το
+token και εμπιστεύεται ό,τι βρει μέσα.
 
 ```bash
-python3 seed.py      # φτιάχνει το users.db από την αρχή
-python3 checks.py    # ο βαθμολογητής, ξεκινάς από 4/9
+python3 mint.py             # φτιάχνει tokens για δοκιμές
+uvicorn main:app --reload   # το service σου, στο http://127.0.0.1:8000
+python3 checks.py           # ο βαθμολογητής, ξεκινάς από 2/8
 ```
 
 ```text
-seed.py      φτιάχνει τη βάση, τρέξ' το πρώτο
-users.py     η εγγραφή και η σύνδεση, εδώ δουλεύεις
+main.py      το service, εδώ δουλεύεις
+mint.py      φτιάχνει tokens για να δοκιμάζεις με curl
 checks.py    ο βαθμολογητής
 ```
