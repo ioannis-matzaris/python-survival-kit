@@ -16,5 +16,6 @@
             }
         }
     },
-    "postCreateCommand": "pip install fastapi uvicorn httpx pytest"
+    "postCreateCommand": "sudo apt-get update && sudo apt-get install -y redis-server && pip install fastapi uvicorn httpx pytest email-validator sqlalchemy bcrypt pyjwt redis rq",
+    "postStartCommand": "sudo service redis-server start"
 }

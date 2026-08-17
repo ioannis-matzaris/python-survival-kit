@@ -6,19 +6,22 @@
 αυτό το repo με το χέρι: το lab κάθε κεφαλαίου έχει ένα κουμπί που σου φτιάχνει
 ένα Codespace στο σωστό branch, με το περιβάλλον ήδη στημένο.
 
-## auth-and-security-passwords
+## caching-and-jobs-slow-endpoint
 
-Ένα ενδιάμεσο lab του κεφαλαίου `auth-and-security`. Η εγγραφή και η σύνδεση
-δουλεύουν, και ο κωδικός του καθενός είναι διαβάσιμος από όποιον ανοίξει τη
-βάση.
+Ένα ενδιάμεσο lab του κεφαλαίου `caching-and-jobs`. Η αναφορά του μήνα
+ξαναδιαβάζει ένα εκατομμύριο γραμμές σε κάθε κλήση.
 
 ```bash
-python3 seed.py      # φτιάχνει το users.db από την αρχή
-python3 checks.py    # ο βαθμολογητής, ξεκινάς από 4/9
+python3 seed.py             # φτιάχνει το shop.db, θέλει λίγα δευτερόλεπτα
+uvicorn main:app --reload   # το service σου, στο http://127.0.0.1:8000
+python3 checks.py           # ο βαθμολογητής, ξεκινάς από 3/7
 ```
+
+Το Redis τρέχει ήδη στο Codespace. Αν το σταματήσεις, ξεκίνα το ξανά με
+`sudo service redis-server start`.
 
 ```text
 seed.py      φτιάχνει τη βάση, τρέξ' το πρώτο
-users.py     η εγγραφή και η σύνδεση, εδώ δουλεύεις
+main.py      το service, εδώ δουλεύεις
 checks.py    ο βαθμολογητής
 ```

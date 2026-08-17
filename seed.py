@@ -1,32 +1,46 @@
-"""Φτιάχνει το users.db από το μηδέν. Τρέξε: python3 seed.py"""
+"""Φτιάχνει το shop.db με ένα εκατομμύριο παραγγελίες. Τρέξε: python3 seed.py"""
 
+import random
 import sqlite3
+from datetime import date, timedelta
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-DB = HERE / "users.db"
-
-PEOPLE = [
-    ("maria@example.gr", "kalimera123"),
-    ("giorgos@example.gr", "kalimera123"),
-    ("eleni@example.gr", "Th3sSal0niki!"),
-]
+DB = HERE / "shop.db"
+ORDERS = 1_000_000
+START = date(2025, 1, 1)
 
 if DB.exists():
     DB.unlink()
 
 connection = sqlite3.connect(DB)
-connection.execute(
+connection.executescript(
     """
-    CREATE TABLE users (
-        id INTEGER PRIMARY KEY,
-        email TEXT NOT NULL UNIQUE,
-        password TEXT NOT NULL
-    )
+    CREATE TABLE orders (
+        reference TEXT PRIMARY KEY,
+        customer_id INTEGER NOT NULL,
+        created TEXT NOT NULL,
+        total_cents INTEGER NOT NULL
+    );
     """
 )
-connection.executemany("INSERT INTO users (email, password) VALUES (?, ?)", PEOPLE)
+
+generator = random.Random(20260817)
+
+
+def rows():
+    for number in range(ORDERS):
+        day = START + timedelta(days=generator.randrange(600))
+        yield (
+            f"PAR-{number:07d}",
+            generator.randrange(1, 5000),
+            day.isoformat(),
+            generator.randrange(500, 40000),
+        )
+
+
+connection.executemany("INSERT INTO orders VALUES (?, ?, ?, ?)", rows())
 connection.commit()
 connection.close()
 
-print(f"Έτοιμο: {DB.name} με {len(PEOPLE)} χρήστες")
+print(f"Έτοιμο: {DB.name} με {ORDERS} παραγγελίες")
