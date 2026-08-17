@@ -16,5 +16,5 @@
             }
         }
     },
-    "postCreateCommand": "pip install fastapi uvicorn httpx pytest"
+    "postCreateCommand": "pip install fastapi uvicorn httpx pytest email-validator sqlalchemy bcrypt pyjwt"
 }
