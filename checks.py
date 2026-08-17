@@ -1,8 +1,8 @@
 """Ο βαθμολογητής του lab. Τρέξε: python3 checks.py
 
-Ξεκινάει το service σου, ζητάει την ίδια αναφορά δύο φορές και κρατάει χρόνο.
-Μετά ανοίγει το Redis και κοιτάει τι άφησες μέσα. Σταμάτα τον δικό σου uvicorn
-πριν το τρέξεις: η θύρα 8000 δεν χωράει δύο.
+Ζητάει τιμές, αλλάζει τιμές, και ξαναζητάει. Ανάμεσα κοιτάει τι κρατάει το
+Redis. Ξαναφτιάχνει τη βάση κάθε φορά, ώστε να ξεκινάει πάντα από τις ίδιες
+τιμές. Σταμάτα τον δικό σου uvicorn πριν το τρέξεις.
 """
 
 import json
@@ -21,8 +21,6 @@ HERE = Path(__file__).resolve().parent
 HOST = "127.0.0.1"
 PORT = 8000
 BASE = f"http://{HOST}:{PORT}"
-JULY = {"orders": 51645, "total_cents": 1047231143}
-JUNE = {"orders": 49812, "total_cents": 1010130048}
 BUDGET_MS = 20.0
 
 results: list[tuple[bool, str]] = []
@@ -44,10 +42,17 @@ def port_is_free() -> bool:
         probe.close()
 
 
-def call(path: str) -> tuple[int, Any, float]:
+def call(path: str, payload: Any = None, method: str = "GET") -> tuple[int, Any, float]:
     started = time.perf_counter()
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        f"{BASE}{path}",
+        data=data,
+        headers={"Content-Type": "application/json"} if data else {},
+        method=method,
+    )
     try:
-        with urllib.request.urlopen(f"{BASE}{path}", timeout=30) as answer:
+        with urllib.request.urlopen(request, timeout=30) as answer:
             raw = answer.read().decode("utf-8")
             elapsed = (time.perf_counter() - started) * 1000
             return answer.status, json.loads(raw) if raw else None, elapsed
@@ -60,7 +65,7 @@ def wait_until_up(process: "subprocess.Popen[bytes]", seconds: float = 40.0) -> 
     while time.time() < deadline:
         if process.poll() is not None:
             return False
-        if call("/report?month=2025-01")[0] != 0:
+        if call("/products/ZAX-1/price")[0] != 0:
             return True
         time.sleep(0.3)
     return False
@@ -82,6 +87,7 @@ except redis.RedisError:
     sys.exit(1)
 
 cache.flushdb()
+subprocess.run([sys.executable, str(HERE / "seed.py")], cwd=HERE, stdout=subprocess.DEVNULL, check=True)
 
 service = subprocess.Popen(
     [sys.executable, "-m", "uvicorn", "main:app", "--host", HOST, "--port", str(PORT)],
@@ -93,33 +99,39 @@ service = subprocess.Popen(
 try:
     report("Το service ξεκινάει και απαντάει στο 8000", wait_until_up(service))
 
-    status, july, cold_ms = call("/report?month=2025-07")
-    report("Η αναφορά του Ιουλίου βγάζει σωστά νούμερα", status == 200 and july == JULY)
-
-    status, again, warm_ms = call("/report?month=2025-07")
+    status, first, _ = call("/products/KAF-500/price")
     report(
-        f"Η δεύτερη κλήση για τον ίδιο μήνα κάτω από {BUDGET_MS:.0f} ms ({warm_ms:.1f})",
-        status == 200 and again == JULY and warm_ms < BUDGET_MS,
+        "Η τιμή του καφέ βγαίνει σωστά την πρώτη φορά",
+        status == 200 and isinstance(first, dict) and first.get("price") == "6.40",
     )
 
-    status, june, _ = call("/report?month=2025-06")
+    status, second, warm_ms = call("/products/KAF-500/price")
     report(
-        "Άλλος μήνας δίνει τα δικά του νούμερα, όχι του Ιουλίου",
-        status == 200 and june == JUNE,
+        f"Η δεύτερη κλήση έρχεται από το cache, κάτω από {BUDGET_MS:.0f} ms ({warm_ms:.1f})",
+        status == 200 and second == first and warm_ms < BUDGET_MS,
     )
 
-    keys = sorted(cache.keys("*"))
-    report("Το cache ζει στο Redis, όχι μέσα στο process", len(keys) >= 2)
+    call("/products/ZAX-1/price")
+    sugar_cached = cache.exists("price:ZAX-1") == 1
 
-    ttls = [cache.ttl(key) for key in keys]
+    status, _, _ = call("/products/KAF-500/price", {"price_cents": 710}, "PUT")
+    report("Η αλλαγή τιμής περνάει", status == 200)
+
+    status, after, _ = call("/products/KAF-500/price")
+    report(
+        "Αμέσως μετά την αλλαγή, η τιμή που σερβίρεται είναι η καινούρια",
+        status == 200 and isinstance(after, dict) and after.get("price") == "7.10",
+    )
+
+    report(
+        "Η αλλαγή στον καφέ δεν πέταξε το cache της ζάχαρης",
+        sugar_cached and cache.exists("price:ZAX-1") == 1,
+    )
+
+    ttls = [cache.ttl(key) for key in cache.keys("*")]
     report(
         "Κάθε κλειδί έχει προθεσμία λήξης, δεν μένει για πάντα",
         bool(ttls) and all(isinstance(one, int) and one > 0 for one in ttls),
-    )
-
-    report(
-        "Ο μήνας είναι μέσα στο κλειδί, ώστε να μην μπερδεύονται δύο αναφορές",
-        any("2025-07" in key for key in keys) and any("2025-06" in key for key in keys),
     )
 finally:
     service.terminate()
