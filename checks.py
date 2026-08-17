@@ -1,7 +1,8 @@
 """Ο βαθμολογητής του lab. Τρέξε: python3 checks.py
 
-Φτιάχνει ο ίδιος έξι tokens, ένα σωστό και πέντε χαλασμένα, και κοιτάει ποιο
-δέχεται το service σου. Σταμάτα τον δικό σου uvicorn πριν το τρέξεις.
+Μπαίνει ως δύο διαφορετικοί πελάτες με έγκυρα tokens, και ζητάει ο ένας τα
+πράγματα του άλλου. Ξαναφτιάχνει τη βάση κάθε φορά. Σταμάτα τον δικό σου
+uvicorn πριν το τρέξεις.
 """
 
 import json
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import jwt
+import sqlite3
 
 HERE = Path(__file__).resolve().parent
 HOST = "127.0.0.1"
@@ -43,9 +45,9 @@ def port_is_free() -> bool:
         probe.close()
 
 
-def call(token: str | None) -> tuple[int, Any]:
+def call(path: str, token: str | None, method: str = "GET") -> tuple[int, Any]:
     headers = {"Authorization": f"Bearer {token}"} if token is not None else {}
-    request = urllib.request.Request(f"{BASE}/me", headers=headers)
+    request = urllib.request.Request(f"{BASE}{path}", headers=headers, method=method)
     try:
         with urllib.request.urlopen(request, timeout=10) as answer:
             raw = answer.read().decode("utf-8")
@@ -69,22 +71,16 @@ def wait_until_up(process: "subprocess.Popen[bytes]", seconds: float = 30.0) -> 
     while time.time() < deadline:
         if process.poll() is not None:
             return False
-        if call(GOOD)[0] != 0:
+        if call("/orders", MARIA)[0] != 0:
             return True
         time.sleep(0.3)
     return False
 
 
-GOOD = mint({"sub": "1", "exp": now() + timedelta(minutes=30), "iat": now()})
-EXPIRED = mint({"sub": "1", "exp": now() - timedelta(minutes=5), "iat": now() - timedelta(hours=1)})
-NO_EXPIRY = mint({"sub": "1"})
-OTHER_KEY = mint({"sub": "1", "exp": now() + timedelta(minutes=30)}, OTHER_SECRET)
+MARIA = mint({"sub": "1", "exp": now() + timedelta(minutes=30)})
+GIORGOS = mint({"sub": "2", "exp": now() + timedelta(minutes=30)})
 
-head, payload, signature = GOOD.split(".")
-forged_payload = (
-    jwt.utils.base64url_encode(json.dumps({"sub": "2"}).encode("utf-8")).decode("utf-8")
-)
-FORGED = f"{head}.{forged_payload}.{signature}"
+subprocess.run([sys.executable, str(HERE / "seed.py")], cwd=HERE, stdout=subprocess.DEVNULL, check=True)
 
 if not (HERE / "main.py").exists():
     print("Δεν βρήκα το main.py στη ρίζα του repo.")
@@ -104,29 +100,51 @@ service = subprocess.Popen(
 try:
     report("Το service ξεκινάει και απαντάει στο 8000", wait_until_up(service))
 
-    status, body = call(GOOD)
+    status, mine = call("/orders/1", MARIA)
     report(
-        "Έγκυρο token δίνει 200 και το σωστό όνομα",
-        status == 200 and isinstance(body, dict) and body.get("name") == "Μαρία Παπαδοπούλου",
+        "Η Μαρία βλέπει τη δική της παραγγελία",
+        status == 200 and isinstance(mine, dict) and mine.get("reference") == "PAR-1001",
     )
 
-    status, _ = call(FORGED)
-    report("Token με πειραγμένο περιεχόμενο παίρνει 401", status == 401)
+    status, stolen = call("/orders/3", MARIA)
+    report("Η Μαρία δεν βλέπει την παραγγελία του Γιώργου", status == 404)
 
-    status, _ = call(EXPIRED)
-    report("Ληγμένο token παίρνει 401", status == 401)
+    status, listing = call("/orders", MARIA)
+    report(
+        "Η λίστα της Μαρίας έχει μόνο τις δικές της δύο",
+        status == 200 and isinstance(listing, list) and len(listing) == 2,
+    )
 
-    status, _ = call(NO_EXPIRY)
-    report("Token χωρίς ημερομηνία λήξης παίρνει 401", status == 401)
+    status, wider = call("/orders?user_id=2", MARIA)
+    report(
+        "Το user_id στο URL δεν της δίνει τις παραγγελίες του Γιώργου",
+        status in (200, 400, 404, 422)
+        and (not isinstance(wider, list) or len(wider) == 2),
+    )
 
-    status, _ = call(OTHER_KEY)
-    report("Token υπογεγραμμένο με άλλο μυστικό παίρνει 401", status == 401)
+    status, _ = call("/orders/3/cancel", MARIA, "POST")
+    connection = sqlite3.connect(HERE / "shop.db")
+    still = connection.execute("SELECT status FROM orders WHERE id = 3").fetchone()[0]
+    connection.close()
+    report(
+        "Η Μαρία δεν μπορεί να ακυρώσει ξένη παραγγελία",
+        status == 404 and still == "sent",
+    )
 
-    status, _ = call(None)
-    report("Καθόλου token παίρνει 401", status == 401)
+    status, _ = call("/orders/2/cancel", MARIA, "POST")
+    connection = sqlite3.connect(HERE / "shop.db")
+    own = connection.execute("SELECT status FROM orders WHERE id = 2").fetchone()[0]
+    connection.close()
+    report(
+        "Η Μαρία ακυρώνει κανονικά τη δική της",
+        status == 200 and own == "cancelled",
+    )
 
-    status, _ = call("skoupidia.skoupidia.skoupidia")
-    report("Σκουπίδια στη θέση του token παίρνουν 401, όχι 500", status == 401)
+    status, his = call("/orders", GIORGOS)
+    report(
+        "Ο Γιώργος βλέπει τις τρεις δικές του, άθικτες",
+        status == 200 and isinstance(his, list) and len(his) == 3,
+    )
 finally:
     service.terminate()
     try:
