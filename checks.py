@@ -1,12 +1,13 @@
 """Ο βαθμολογητής του lab. Τρέξε: python3 checks.py
 
-Ζητάει τιμές, αλλάζει τιμές, και ξαναζητάει. Ανάμεσα κοιτάει τι κρατάει το
-Redis. Ξαναφτιάχνει τη βάση κάθε φορά, ώστε να ξεκινάει πάντα από τις ίδιες
-τιμές. Σταμάτα τον δικό σου uvicorn πριν το τρέξεις.
+Στέλνει μια παραγγελία και κρατάει χρόνο, κοιτάει αν μπήκε job στο queue, και
+μετά τρέχει ο ίδιος έναν worker για να δει αν το job κάνει τη δουλειά του.
+Ξαναφτιάχνει τη βάση κάθε φορά. Σταμάτα τον δικό σου uvicorn πριν το τρέξεις.
 """
 
 import json
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -16,12 +17,15 @@ from pathlib import Path
 from typing import Any
 
 import redis
+from rq import Queue
 
 HERE = Path(__file__).resolve().parent
+DB = HERE / "shop.db"
 HOST = "127.0.0.1"
 PORT = 8000
 BASE = f"http://{HOST}:{PORT}"
-BUDGET_MS = 20.0
+BUDGET_MS = 300.0
+CUSTOMER = "maria@example.gr"
 
 results: list[tuple[bool, str]] = []
 
@@ -55,7 +59,11 @@ def call(path: str, payload: Any = None, method: str = "GET") -> tuple[int, Any,
         with urllib.request.urlopen(request, timeout=30) as answer:
             raw = answer.read().decode("utf-8")
             elapsed = (time.perf_counter() - started) * 1000
-            return answer.status, json.loads(raw) if raw else None, elapsed
+            try:
+                body = json.loads(raw) if raw else None
+            except json.JSONDecodeError:
+                body = raw
+            return answer.status, body, elapsed
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError):
         return 0, None, (time.perf_counter() - started) * 1000
 
@@ -65,14 +73,14 @@ def wait_until_up(process: "subprocess.Popen[bytes]", seconds: float = 40.0) -> 
     while time.time() < deadline:
         if process.poll() is not None:
             return False
-        if call("/products/ZAX-1/price")[0] != 0:
+        if call("/docs")[0] != 0:
             return True
         time.sleep(0.3)
     return False
 
 
-if not (HERE / "shop.db").exists():
-    print("Δεν βρήκα το shop.db. Τρέξε πρώτα: python3 seed.py")
+if not (HERE / "main.py").exists():
+    print("Δεν βρήκα το main.py στη ρίζα του repo.")
     sys.exit(1)
 
 if not port_is_free():
@@ -99,39 +107,55 @@ service = subprocess.Popen(
 try:
     report("Το service ξεκινάει και απαντάει στο 8000", wait_until_up(service))
 
-    status, first, _ = call("/products/KAF-500/price")
+    status, created, elapsed_ms = call(
+        "/orders", {"email": CUSTOMER, "total_cents": 4520}, "POST"
+    )
+    report("Η παραγγελία γίνεται δεκτή με 201", status == 201)
     report(
-        "Η τιμή του καφέ βγαίνει σωστά την πρώτη φορά",
-        status == 200 and isinstance(first, dict) and first.get("price") == "6.40",
+        f"Ο πελάτης δεν περιμένει το email, κάτω από {BUDGET_MS:.0f} ms ({elapsed_ms:.0f})",
+        status == 201 and elapsed_ms < BUDGET_MS,
     )
 
-    status, second, warm_ms = call("/products/KAF-500/price")
+    connection = sqlite3.connect(DB)
+    rows = connection.execute("SELECT id, email FROM orders").fetchall()
+    connection.close()
     report(
-        f"Η δεύτερη κλήση έρχεται από το cache, κάτω από {BUDGET_MS:.0f} ms ({warm_ms:.1f})",
-        status == 200 and second == first and warm_ms < BUDGET_MS,
+        "Η παραγγελία γράφτηκε στη βάση",
+        len(rows) == 1 and rows[0][1] == CUSTOMER,
     )
 
-    call("/products/ZAX-1/price")
-    sugar_cached = cache.exists("price:ZAX-1") == 1
+    queue = Queue(connection=redis.Redis())
+    waiting = queue.count
+    report("Ένα job περιμένει στο queue", waiting == 1)
 
-    status, _, _ = call("/products/KAF-500/price", {"price_cents": 710}, "PUT")
-    report("Η αλλαγή τιμής περνάει", status == 200)
-
-    status, after, _ = call("/products/KAF-500/price")
+    order_id = rows[0][0] if rows else 0
+    receipt_before = cache.get(f"receipt:{order_id}")
     report(
-        "Αμέσως μετά την αλλαγή, η τιμή που σερβίρεται είναι η καινούρια",
-        status == 200 and isinstance(after, dict) and after.get("price") == "7.10",
+        "Η απόδειξη δεν έχει σταλεί ακόμα, γιατί δεν έτρεξε worker",
+        receipt_before is None,
     )
 
+    worker = subprocess.run(
+        [sys.executable, "-m", "rq.cli", "worker", "--burst"],
+        cwd=HERE,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
     report(
-        "Η αλλαγή στον καφέ δεν πέταξε το cache της ζάχαρης",
-        sugar_cached and cache.exists("price:ZAX-1") == 1,
+        "Ο worker παίρνει το job και στέλνει την απόδειξη",
+        receipt_before is None and cache.get(f"receipt:{order_id}") == CUSTOMER,
     )
 
-    ttls = [cache.ttl(key) for key in cache.keys("*")]
+    alone = subprocess.run(
+        [sys.executable, "-c", "import sys, tasks; assert 'fastapi' not in sys.modules"],
+        cwd=HERE,
+        capture_output=True,
+        text=True,
+    )
     report(
-        "Κάθε κλειδί έχει προθεσμία λήξης, δεν μένει για πάντα",
-        bool(ttls) and all(isinstance(one, int) and one > 0 for one in ttls),
+        "Η δουλειά ζει στο tasks.py και φορτώνει χωρίς το FastAPI",
+        (HERE / "tasks.py").exists() and alone.returncode == 0,
     )
 finally:
     service.terminate()
