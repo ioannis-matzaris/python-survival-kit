@@ -1,13 +1,15 @@
-"""Οι παραγγελίες του πελάτη. Τρέξε: uvicorn main:app --reload
+"""Το API του e-shop, ορθάνοιχτο. Τρέξε: uvicorn main:app --reload
 
-Το token ελέγχεται σωστά. Ποιος ζητάει τι, δεν το ελέγχει κανείς.
+Δουλεύει. Η εγγραφή, η σύνδεση, οι παραγγελίες. Και δεν προστατεύει τίποτα.
 """
 
 import sqlite3
 from pathlib import Path
 
+import bcrypt
 import jwt
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel, EmailStr
 
 HERE = Path(__file__).resolve().parent
 DB = HERE / "shop.db"
@@ -17,58 +19,59 @@ ALGORITHM = "HS256"
 app = FastAPI()
 
 
-def current_user(authorization: str = Header(default="")) -> int:
-    token = authorization.removeprefix("Bearer ").strip()
-    if not token:
-        raise HTTPException(status_code=401, detail="Λείπει το token")
-    try:
-        payload = jwt.decode(
-            token, SECRET, algorithms=[ALGORITHM], options={"require": ["exp", "sub"]}
-        )
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Το token δεν ισχύει")
-    return int(payload["sub"])
+class Signup(BaseModel):
+    email: EmailStr
+    password: str
+    is_admin: bool = False
 
 
-def rows(query: str, parameters: tuple) -> list[tuple]:
+class Login(BaseModel):
+    email: EmailStr
+    password: str
+
+
+def query(sql: str, parameters: tuple = ()) -> list[tuple]:
     connection = sqlite3.connect(DB)
-    found = connection.execute(query, parameters).fetchall()
+    found = connection.execute(sql, parameters).fetchall()
     connection.close()
     return found
 
 
-@app.get("/orders")
-def list_orders(user_id: int | None = None, user: int = Depends(current_user)) -> list[dict]:
-    owner = user_id if user_id is not None else user
-    found = rows(
-        "SELECT id, reference, total_cents, status FROM orders WHERE user_id = ?",
-        (owner,),
+@app.post("/signup", status_code=201)
+def signup(body: Signup) -> dict[str, str]:
+    connection = sqlite3.connect(DB)
+    cursor = connection.execute(
+        "INSERT INTO users (email, password, is_admin) VALUES (?, ?, ?)",
+        (body.email, body.password, int(body.is_admin)),
     )
-    return [
-        {"id": one[0], "reference": one[1], "total_cents": one[2], "status": one[3]}
-        for one in found
-    ]
+    connection.commit()
+    user_id = cursor.lastrowid
+    connection.close()
+    return {"id": str(user_id), "email": body.email}
+
+
+@app.post("/login")
+def login(body: Login) -> dict[str, str]:
+    found = query("SELECT id, password FROM users WHERE email = ?", (body.email,))
+    if not found or not bcrypt.checkpw(body.password.encode("utf-8"), found[0][1].encode("utf-8")):
+        raise HTTPException(status_code=401, detail="Λάθος στοιχεία")
+    token = jwt.encode({"sub": str(found[0][0])}, SECRET, algorithm=ALGORITHM)
+    return {"token": token}
+
+
+def current_user(authorization: str = Header(default="")) -> int:
+    token = authorization.removeprefix("Bearer ").strip()
+    payload = jwt.decode(token, options={"verify_signature": False})
+    return int(payload["sub"])
 
 
 @app.get("/orders/{order_id}")
-def read_order(order_id: int, user: int = Depends(current_user)) -> dict:
-    found = rows(
-        "SELECT id, reference, total_cents, status FROM orders WHERE id = ?", (order_id,)
+def read_order(order_id: int, authorization: str = Header(default="")) -> dict:
+    current_user(authorization)
+    found = query(
+        "SELECT id, user_id, reference, total_cents FROM orders WHERE id = ?", (order_id,)
     )
     if not found:
         raise HTTPException(status_code=404, detail="Δεν υπάρχει τέτοια παραγγελία")
     one = found[0]
-    return {"id": one[0], "reference": one[1], "total_cents": one[2], "status": one[3]}
-
-
-@app.post("/orders/{order_id}/cancel")
-def cancel_order(order_id: int, user: int = Depends(current_user)) -> dict:
-    connection = sqlite3.connect(DB)
-    changed = connection.execute(
-        "UPDATE orders SET status = 'cancelled' WHERE id = ?", (order_id,)
-    ).rowcount
-    connection.commit()
-    connection.close()
-    if changed == 0:
-        raise HTTPException(status_code=404, detail="Δεν υπάρχει τέτοια παραγγελία")
-    return {"id": order_id, "status": "cancelled"}
+    return {"id": one[0], "reference": one[2], "total_cents": one[3]}
