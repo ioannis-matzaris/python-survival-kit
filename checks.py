@@ -1,8 +1,8 @@
 """Ο βαθμολογητής του lab. Τρέξε: python3 checks.py
 
-Στέλνει μια παραγγελία και κρατάει χρόνο, κοιτάει αν μπήκε job στο queue, και
-μετά τρέχει ο ίδιος έναν worker για να δει αν το job κάνει τη δουλειά του.
-Ξαναφτιάχνει τη βάση κάθε φορά. Σταμάτα τον δικό σου uvicorn πριν το τρέξεις.
+Κοιτάει τρία πράγματα μαζί: τι κρατάει το cache, τι φεύγει από το request, και
+τι γίνεται όταν το ίδιο job τρέξει δεύτερη φορά. Ξαναφτιάχνει τη βάση κάθε
+φορά. Σταμάτα τον δικό σου uvicorn πριν το τρέξεις.
 """
 
 import json
@@ -18,6 +18,8 @@ from typing import Any
 
 import redis
 from rq import Queue
+
+import tasks as tasks_module
 
 HERE = Path(__file__).resolve().parent
 DB = HERE / "shop.db"
@@ -107,55 +109,66 @@ service = subprocess.Popen(
 try:
     report("Το service ξεκινάει και απαντάει στο 8000", wait_until_up(service))
 
+    status, first, _ = call("/products/KAF-500/price")
+    status, second, warm_ms = call("/products/KAF-500/price")
+    report(
+        f"Η δεύτερη κλήση της τιμής απαντάει κάτω από 20 ms ({warm_ms:.1f})",
+        status == 200 and second == first and warm_ms < 20.0,
+    )
+
+    price_keys = [key for key in cache.keys("*") if "KAF-500" in key]
+    report(
+        "Το κλειδί της τιμής ζει στο Redis και έχει προθεσμία λήξης",
+        bool(price_keys) and all(cache.ttl(key) > 0 for key in price_keys),
+    )
+
+    call("/products/KAF-500/price", {"price_cents": 710}, "PUT")
+    status, after, _ = call("/products/KAF-500/price")
+    report(
+        "Μετά την αλλαγή τιμής σερβίρεται η καινούρια, όχι η παλιά",
+        status == 200 and isinstance(after, dict) and after.get("price") == "7.10",
+    )
+
     status, created, elapsed_ms = call(
         "/orders", {"email": CUSTOMER, "total_cents": 4520}, "POST"
     )
-    report("Η παραγγελία γίνεται δεκτή με 201", status == 201)
     report(
-        f"Ο πελάτης δεν περιμένει το email, κάτω από {BUDGET_MS:.0f} ms ({elapsed_ms:.0f})",
+        f"Η παραγγελία απαντάει χωρίς να περιμένει το email ({elapsed_ms:.0f} ms)",
         status == 201 and elapsed_ms < BUDGET_MS,
     )
 
     connection = sqlite3.connect(DB)
-    rows = connection.execute("SELECT id, email FROM orders").fetchall()
+    rows = connection.execute("SELECT id FROM orders").fetchall()
     connection.close()
-    report(
-        "Η παραγγελία γράφτηκε στη βάση",
-        len(rows) == 1 and rows[0][1] == CUSTOMER,
-    )
+    order_id = rows[0][0] if rows else 0
 
     queue = Queue(connection=redis.Redis())
-    waiting = queue.count
-    report("Ένα job περιμένει στο queue", waiting == 1)
+    report("Ένα job περιμένει στο queue", queue.count == 1)
 
-    order_id = rows[0][0] if rows else 0
-    receipt_before = cache.get(f"receipt:{order_id}")
-    report(
-        "Η απόδειξη δεν έχει σταλεί ακόμα, γιατί δεν έτρεξε worker",
-        receipt_before is None,
-    )
-
-    worker = subprocess.run(
+    subprocess.run(
         [sys.executable, "-m", "rq.cli", "worker", "--burst"],
-        cwd=HERE,
-        capture_output=True,
-        text=True,
-        timeout=60,
+        cwd=HERE, capture_output=True, text=True, timeout=60,
     )
-    report(
-        "Ο worker παίρνει το job και στέλνει την απόδειξη",
-        receipt_before is None and cache.get(f"receipt:{order_id}") == CUSTOMER,
-    )
+    connection = sqlite3.connect(DB)
+    receipts_once = connection.execute(
+        "SELECT COUNT(*) FROM receipts WHERE order_id = ?", (order_id,)
+    ).fetchone()[0]
+    connection.close()
+    report("Ο worker στέλνει την απόδειξη μία φορά", receipts_once == 1)
 
-    alone = subprocess.run(
-        [sys.executable, "-c", "import sys, tasks; assert 'fastapi' not in sys.modules"],
-        cwd=HERE,
-        capture_output=True,
-        text=True,
+    queue.enqueue(tasks_module.send_receipt, order_id, CUSTOMER)
+    subprocess.run(
+        [sys.executable, "-m", "rq.cli", "worker", "--burst"],
+        cwd=HERE, capture_output=True, text=True, timeout=60,
     )
+    connection = sqlite3.connect(DB)
+    receipts_twice = connection.execute(
+        "SELECT COUNT(*) FROM receipts WHERE order_id = ?", (order_id,)
+    ).fetchone()[0]
+    connection.close()
     report(
-        "Η δουλειά ζει στο tasks.py και φορτώνει χωρίς το FastAPI",
-        (HERE / "tasks.py").exists() and alone.returncode == 0,
+        f"Το ίδιο job δεύτερη φορά δεν στέλνει δεύτερη απόδειξη ({receipts_twice})",
+        receipts_twice == 1,
     )
 finally:
     service.terminate()
