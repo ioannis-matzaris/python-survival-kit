@@ -1,74 +1,64 @@
-"""Το service του e-shop. Τρέξε: uvicorn main:app --reload
+"""Το API των παραγγελιών. Τρέξε: uvicorn main:app --reload
 
-Οι τιμές ξαναδιαβάζονται σε κάθε κλήση και η απόδειξη φεύγει μέσα από το
-request. Και τα δύο δουλεύουν, και τα δύο κοστίζουν.
+Κοιτάει αν υπάρχει απόθεμα και μετά το μειώνει. Με έναν πελάτη τη φορά είναι
+σωστό. Με είκοσι μαζί, πουλάει κομμάτια που δεν έχει.
 """
 
 import sqlite3
+import time
 from pathlib import Path
 
-import redis
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, ConfigDict, EmailStr
-
-import tasks
+from pydantic import BaseModel
 
 HERE = Path(__file__).resolve().parent
 DB = HERE / "shop.db"
 
 app = FastAPI()
-cache = redis.Redis(decode_responses=True)
 
 
-class NewOrder(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    email: EmailStr
-    total_cents: int
-
-
-class NewPrice(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    price_cents: int
+class Order(BaseModel):
+    sku: str
+    quantity: int
+    customer: str
 
 
-@app.get("/products/{code}/price")
-def price(code: str) -> dict[str, str]:
-    connection = sqlite3.connect(DB)
-    row = connection.execute(
-        "SELECT price_cents FROM products WHERE code = ?", (code,)
-    ).fetchone()
+def connect() -> sqlite3.Connection:
+    return sqlite3.connect(DB, timeout=15)
+
+
+@app.get("/products/{sku}")
+def read_product(sku: str) -> dict[str, int | str]:
+    connection = connect()
+    found = connection.execute("SELECT sku, name, stock FROM products WHERE sku = ?", (sku,)).fetchall()
     connection.close()
-    if row is None:
+    if not found:
         raise HTTPException(status_code=404, detail="Δεν υπάρχει τέτοιο προϊόν")
-    return {"code": code, "price": f"{row[0] / 100:.2f}"}
-
-
-@app.put("/products/{code}/price")
-def set_price(code: str, body: NewPrice) -> dict[str, str]:
-    connection = sqlite3.connect(DB)
-    changed = connection.execute(
-        "UPDATE products SET price_cents = ? WHERE code = ?", (body.price_cents, code)
-    ).rowcount
-    connection.commit()
-    connection.close()
-    if changed == 0:
-        raise HTTPException(status_code=404, detail="Δεν υπάρχει τέτοιο προϊόν")
-    return {"code": code, "price": f"{body.price_cents / 100:.2f}"}
+    return {"sku": found[0][0], "name": found[0][1], "stock": found[0][2]}
 
 
 @app.post("/orders", status_code=201)
-def create_order(order: NewOrder) -> dict[str, str]:
-    connection = sqlite3.connect(DB)
+def place_order(body: Order) -> dict[str, int | str]:
+    connection = connect()
+
+    found = connection.execute("SELECT stock FROM products WHERE sku = ?", (body.sku,)).fetchall()
+    if not found:
+        connection.close()
+        raise HTTPException(status_code=404, detail="Δεν υπάρχει τέτοιο προϊόν")
+
+    stock = found[0][0]
+    time.sleep(0.02)
+
+    if stock < body.quantity:
+        connection.close()
+        raise HTTPException(status_code=409, detail="Δεν έχει τόσα κομμάτια")
+
+    connection.execute("UPDATE products SET stock = ? WHERE sku = ?", (stock - body.quantity, body.sku))
     cursor = connection.execute(
-        "INSERT INTO orders (email, total_cents) VALUES (?, ?)",
-        (order.email, order.total_cents),
+        "INSERT INTO orders (sku, quantity, customer) VALUES (?, ?, ?)",
+        (body.sku, body.quantity, body.customer),
     )
     connection.commit()
     order_id = cursor.lastrowid
     connection.close()
-
-    tasks.send_receipt(order_id, order.email)
-
-    return {"order_id": str(order_id), "status": "η απόδειξη στάλθηκε"}
+    return {"id": order_id or 0, "sku": body.sku, "quantity": body.quantity}
