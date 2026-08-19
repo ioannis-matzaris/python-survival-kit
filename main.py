@@ -1,79 +1,32 @@
-"""Το API του θεάτρου. Τρέξε: uvicorn main:app --reload
+"""Το service των παραγγελιών. Τρέξε: uvicorn main:app --reload
 
-Τρία endpoints, και τα τρία σωστά με έναν χρήστη. Με πενήντα ταυτόχρονους, το
-ένα παγώνει το service, το άλλο το καίει, και το τρίτο πουλάει θέσεις που δεν
-υπάρχουν.
+Διαβάζει τις ρυθμίσεις του από το περιβάλλον, με προεπιλογές παντού, και
+ξεκινάει ό,τι κι αν του δώσεις. Ακόμα κι αν δεν του δώσεις τίποτα.
 """
 
-import sqlite3
-from pathlib import Path
+import os
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI
 
-from outside import crunch, fetch_occupancy_blocking
-
-HERE = Path(__file__).resolve().parent
-DB = HERE / "hall.db"
+DEBUG = bool(os.environ.get("DEBUG", "false"))
+PORT = os.environ.get("PORT", "8000")
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///dev.db")
+TIMEOUT_SECONDS = os.environ.get("TIMEOUT_SECONDS", "5")
+PROVIDER_API_KEY = "kleidi-tou-parochou-1234567890"
 
 app = FastAPI()
 
 
-class Booking(BaseModel):
-    code: str
-    customer: str
-
-
-def connect() -> sqlite3.Connection:
-    return sqlite3.connect(DB, timeout=15)
-
-
 @app.get("/health")
-async def health() -> dict[str, str]:
+def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/report/{hall}")
-async def report(hall: str) -> dict[str, int | str]:
-    return {"hall": hall, "occupancy": fetch_occupancy_blocking(hall)}
-
-
-@app.get("/crunch/{seed}")
-async def heavy(seed: int) -> dict[str, int]:
-    return {"seed": seed, "total": crunch(seed)}
-
-
-@app.get("/shows/{code}")
-def read_show(code: str) -> dict[str, int | str]:
-    connection = connect()
-    found = connection.execute(
-        "SELECT code, title, seats_left FROM shows WHERE code = ?", (code,)
-    ).fetchall()
-    connection.close()
-    if not found:
-        raise HTTPException(status_code=404, detail="Δεν υπάρχει τέτοια παράσταση")
-    return {"code": found[0][0], "title": found[0][1], "seats_left": found[0][2]}
-
-
-@app.post("/bookings", status_code=201)
-def book(body: Booking) -> dict[str, int | str]:
-    connection = connect()
-
-    found = connection.execute("SELECT seats_left FROM shows WHERE code = ?", (body.code,)).fetchall()
-    if not found:
-        connection.close()
-        raise HTTPException(status_code=404, detail="Δεν υπάρχει τέτοια παράσταση")
-
-    seats_left = found[0][0]
-    if seats_left < 1:
-        connection.close()
-        raise HTTPException(status_code=409, detail="Δεν έμειναν θέσεις")
-
-    connection.execute("UPDATE shows SET seats_left = ? WHERE code = ?", (seats_left - 1, body.code))
-    cursor = connection.execute(
-        "INSERT INTO bookings (code, customer) VALUES (?, ?)", (body.code, body.customer)
-    )
-    connection.commit()
-    booking_id = cursor.lastrowid
-    connection.close()
-    return {"id": booking_id or 0, "code": body.code}
+@app.get("/config")
+def config() -> dict[str, object]:
+    return {
+        "debug": DEBUG,
+        "port": PORT,
+        "database_url": DATABASE_URL,
+        "timeout_seconds": TIMEOUT_SECONDS,
+    }

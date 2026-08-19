@@ -1,32 +1,33 @@
 """Ο βαθμολογητής του lab. Τρέξε: python3 checks.py
 
-Ρίχνει φορτίο και μετράει: πόσο κάνουν τα πολλά μαζί, αν το /health απαντάει
-όσο τρέχουν, και πόσες θέσεις πούλησε το service που είχε είκοσι.
-Ξαναφτιάχνει τη βάση κάθε φορά. Σταμάτα τον δικό σου uvicorn πριν το τρέξεις.
+Δοκιμάζει το service με σωστό περιβάλλον, και μετά με πέντε λάθος. Το σωστό
+πρέπει να ξεκινάει, τα λάθος πρέπει να αρνούνται. Σταμάτα τον δικό σου uvicorn
+πριν το τρέξεις.
 """
 
 import json
+import os
 import socket
-import sqlite3
 import subprocess
 import sys
-import threading
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
-
-from outside import crunch, occupancy_of
 
 HERE = Path(__file__).resolve().parent
 HOST = "127.0.0.1"
 PORT = 8000
 BASE = f"http://{HOST}:{PORT}"
-SHOW = "PAR-1"
-SEATS = 20
-CROWD = 50
+
+GOOD = {
+    "DEBUG": "false",
+    "PORT": "8000",
+    "DATABASE_URL": "sqlite:///shop.db",
+    "TIMEOUT_SECONDS": "5",
+    "PROVIDER_API_KEY": "kleidi-apo-to-perivallon",
+}
 
 results: list[tuple[bool, str]] = []
 
@@ -47,15 +48,9 @@ def port_is_free() -> bool:
         probe.close()
 
 
-def call(path: str, method: str = "GET", payload: Any = None, timeout: float = 60.0) -> tuple[int, Any]:
-    data = None
-    headers = {}
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(f"{BASE}{path}", data=data, headers=headers, method=method)
+def call(path: str) -> tuple[int, Any]:
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as answer:
+        with urllib.request.urlopen(f"{BASE}{path}", timeout=10) as answer:
             raw = answer.read().decode("utf-8")
             return answer.status, json.loads(raw) if raw else None
     except urllib.error.HTTPError as failure:
@@ -64,17 +59,28 @@ def call(path: str, method: str = "GET", payload: Any = None, timeout: float = 6
         return 0, None
 
 
-def query_db(sql: str, parameters: tuple = ()) -> list[tuple]:
-    connection = sqlite3.connect(HERE / "hall.db")
-    found = connection.execute(sql, parameters).fetchall()
-    connection.close()
-    return found
+def environment(**changes: str | None) -> dict[str, str]:
+    clean = {key: value for key, value in os.environ.items() if key not in GOOD}
+    clean.update(GOOD)
+    for key, value in changes.items():
+        if value is None:
+            clean.pop(key, None)
+        else:
+            clean[key] = value
+    return clean
 
 
-def reseed() -> None:
-    subprocess.run(
-        [sys.executable, str(HERE / "seed.py")], cwd=HERE, stdout=subprocess.DEVNULL, check=True
+def refuses(**changes: str | None) -> tuple[bool, str]:
+    """Το service πρέπει να πεθάνει με μη μηδενικό κωδικό, όχι να ξεκινήσει."""
+    finished = subprocess.run(
+        [sys.executable, "-c", "import main"],
+        cwd=HERE,
+        env=environment(**changes),
+        capture_output=True,
+        text=True,
+        timeout=60,
     )
+    return finished.returncode != 0, finished.stdout + finished.stderr
 
 
 def wait_until_up(process: "subprocess.Popen[bytes]", seconds: float = 30.0) -> bool:
@@ -82,23 +88,10 @@ def wait_until_up(process: "subprocess.Popen[bytes]", seconds: float = 30.0) -> 
     while time.time() < deadline:
         if process.poll() is not None:
             return False
-        if call("/health", timeout=2.0)[0] == 200:
+        if call("/health")[0] == 200:
             return True
         time.sleep(0.3)
     return False
-
-
-def health_while(work: "threading.Thread") -> float:
-    delays: list[float] = []
-    work.start()
-    time.sleep(0.15)
-    while work.is_alive():
-        mark = time.time()
-        call("/health", timeout=20.0)
-        delays.append(time.time() - mark)
-        time.sleep(0.05)
-    work.join()
-    return max(delays) if delays else 99.0
 
 
 if not (HERE / "main.py").exists():
@@ -109,77 +102,66 @@ if not port_is_free():
     print(f"Η θύρα {PORT} είναι πιασμένη. Σταμάτα το service σου και ξανατρέξε.")
     sys.exit(1)
 
-reseed()
-
 service = subprocess.Popen(
     [sys.executable, "-m", "uvicorn", "main:app", "--host", HOST, "--port", str(PORT)],
     cwd=HERE,
+    env=environment(),
     stdout=subprocess.DEVNULL,
     stderr=subprocess.DEVNULL,
 )
 
 try:
-    report("Το service ξεκινάει και απαντάει στο 8000", wait_until_up(service))
+    report("Με σωστό περιβάλλον το service ξεκινάει", wait_until_up(service))
 
-    status, one = call("/report/A")
+    status, settings = call("/config")
+    settings = settings if isinstance(settings, dict) else {}
+
+    report("Το /config απαντάει", status == 200 and bool(settings))
     report(
-        "Το /report δίνει τη σωστή πληρότητα",
-        status == 200 and isinstance(one, dict) and one.get("occupancy") == occupancy_of("A"),
+        "Το DEBUG=false διαβάζεται ως ψευδές, όχι ως αληθές",
+        settings.get("debug") is False,
     )
-
-    halls = [f"HALL-{number:02d}" for number in range(CROWD)]
-    started = time.time()
-    with ThreadPoolExecutor(max_workers=CROWD) as visitors:
-        codes = list(visitors.map(lambda hall: call(f"/report/{hall}")[0], halls))
-    report_seconds = time.time() - started
     report(
-        f"Πενήντα ταυτόχρονα /report τελειώνουν κάτω από 2 δευτερόλεπτα ({report_seconds:.2f}s)",
-        all(code == 200 for code in codes) and report_seconds < 2.0,
+        f"Το PORT είναι ακέραιος, όχι κείμενο ({settings.get('port')!r})",
+        isinstance(settings.get("port"), int),
     )
-
-    def report_rush() -> None:
-        with ThreadPoolExecutor(max_workers=20) as visitors:
-            list(visitors.map(lambda number: call(f"/report/HALL-{number:02d}"), range(20)))
-
-    load = threading.Thread(target=report_rush)
     report(
-        "Το /health απαντάει κι όσο τρέχουν τα /report",
-        health_while(load) < 0.3,
+        f"Το TIMEOUT_SECONDS είναι αριθμός ({settings.get('timeout_seconds')!r})",
+        isinstance(settings.get("timeout_seconds"), (int, float))
+        and not isinstance(settings.get("timeout_seconds"), bool),
     )
-
-    status, heavy = call("/crunch/3")
-    report(
-        "Το /crunch δίνει το σωστό σύνολο",
-        status == 200 and isinstance(heavy, dict) and heavy.get("total") == crunch(3),
-    )
-
-    burn = threading.Thread(target=lambda: call("/crunch/5"))
-    report(
-        "Το /health απαντάει κι όσο τρέχει το /crunch",
-        health_while(burn) < 0.3,
-    )
-
-    reseed()
-
-    def grab(number: int) -> int:
-        return call("/bookings", "POST", {"code": SHOW, "customer": f"theatis-{number}"})[0]
-
-    with ThreadPoolExecutor(max_workers=CROWD) as crowd:
-        booking_codes = list(crowd.map(grab, range(CROWD)))
-
-    accepted = sum(1 for code in booking_codes if code == 201)
-    seats_left = query_db("SELECT seats_left FROM shows WHERE code = ?", (SHOW,))[0][0]
-    written = query_db("SELECT COUNT(*) FROM bookings")[0][0]
-
-    report(f"Από τους πενήντα κλείνουν ακριβώς είκοσι ({accepted})", accepted == SEATS)
-    report(f"Οι θέσεις καταλήγουν στο μηδέν, ποτέ αρνητικές ({seats_left})", seats_left == 0)
-    report(f"Οι κρατήσεις στη βάση είναι όσες και οι επιτυχίες ({written})", written == accepted)
 finally:
     service.terminate()
     try:
         service.wait(timeout=5)
     except subprocess.TimeoutExpired:
         service.kill()
+
+missing_ok, missing_output = refuses(DATABASE_URL=None)
+report("Χωρίς DATABASE_URL το service αρνείται να ξεκινήσει", missing_ok)
+report(
+    "Και το μήνυμα ονομάζει τη μεταβλητή που λείπει",
+    missing_ok and "DATABASE_URL" in missing_output.upper(),
+)
+
+report("Με PORT που δεν είναι αριθμός αρνείται", refuses(PORT="ochi-arithmos")[0])
+report("Με TIMEOUT_SECONDS εκτός ορίων αρνείται", refuses(TIMEOUT_SECONDS="0")[0])
+report("Χωρίς PROVIDER_API_KEY αρνείται", refuses(PROVIDER_API_KEY=None)[0])
+
+sources = {path.name: path.read_text(encoding="utf-8") for path in HERE.glob("*.py")}
+outside_settings = [
+    name
+    for name, text in sources.items()
+    if name not in ("settings.py", "checks.py") and ("os.environ" in text or "os.getenv" in text)
+]
+report(
+    f"Το περιβάλλον διαβάζεται από ένα σημείο ({', '.join(outside_settings) or 'κανένα άλλο'})",
+    not outside_settings,
+)
+report(
+    "Κανένα κλειδί δεν είναι γραμμένο μέσα στον κώδικα",
+    all("kleidi-tou-parochou" not in text for name, text in sources.items() if name != "checks.py"),
+)
 
 total_checks = len(results)
 for index, (passed, label) in enumerate(results, start=1):
