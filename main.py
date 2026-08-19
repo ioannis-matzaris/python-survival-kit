@@ -1,74 +1,79 @@
-"""Το service του e-shop. Τρέξε: uvicorn main:app --reload
+"""Το API του θεάτρου. Τρέξε: uvicorn main:app --reload
 
-Οι τιμές ξαναδιαβάζονται σε κάθε κλήση και η απόδειξη φεύγει μέσα από το
-request. Και τα δύο δουλεύουν, και τα δύο κοστίζουν.
+Τρία endpoints, και τα τρία σωστά με έναν χρήστη. Με πενήντα ταυτόχρονους, το
+ένα παγώνει το service, το άλλο το καίει, και το τρίτο πουλάει θέσεις που δεν
+υπάρχουν.
 """
 
 import sqlite3
 from pathlib import Path
 
-import redis
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, ConfigDict, EmailStr
+from pydantic import BaseModel
 
-import tasks
+from outside import crunch, fetch_occupancy_blocking
 
 HERE = Path(__file__).resolve().parent
-DB = HERE / "shop.db"
+DB = HERE / "hall.db"
 
 app = FastAPI()
-cache = redis.Redis(decode_responses=True)
 
 
-class NewOrder(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    email: EmailStr
-    total_cents: int
+class Booking(BaseModel):
+    code: str
+    customer: str
 
 
-class NewPrice(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    price_cents: int
+def connect() -> sqlite3.Connection:
+    return sqlite3.connect(DB, timeout=15)
 
 
-@app.get("/products/{code}/price")
-def price(code: str) -> dict[str, str]:
-    connection = sqlite3.connect(DB)
-    row = connection.execute(
-        "SELECT price_cents FROM products WHERE code = ?", (code,)
-    ).fetchone()
+@app.get("/health")
+async def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/report/{hall}")
+async def report(hall: str) -> dict[str, int | str]:
+    return {"hall": hall, "occupancy": fetch_occupancy_blocking(hall)}
+
+
+@app.get("/crunch/{seed}")
+async def heavy(seed: int) -> dict[str, int]:
+    return {"seed": seed, "total": crunch(seed)}
+
+
+@app.get("/shows/{code}")
+def read_show(code: str) -> dict[str, int | str]:
+    connection = connect()
+    found = connection.execute(
+        "SELECT code, title, seats_left FROM shows WHERE code = ?", (code,)
+    ).fetchall()
     connection.close()
-    if row is None:
-        raise HTTPException(status_code=404, detail="Δεν υπάρχει τέτοιο προϊόν")
-    return {"code": code, "price": f"{row[0] / 100:.2f}"}
+    if not found:
+        raise HTTPException(status_code=404, detail="Δεν υπάρχει τέτοια παράσταση")
+    return {"code": found[0][0], "title": found[0][1], "seats_left": found[0][2]}
 
 
-@app.put("/products/{code}/price")
-def set_price(code: str, body: NewPrice) -> dict[str, str]:
-    connection = sqlite3.connect(DB)
-    changed = connection.execute(
-        "UPDATE products SET price_cents = ? WHERE code = ?", (body.price_cents, code)
-    ).rowcount
-    connection.commit()
-    connection.close()
-    if changed == 0:
-        raise HTTPException(status_code=404, detail="Δεν υπάρχει τέτοιο προϊόν")
-    return {"code": code, "price": f"{body.price_cents / 100:.2f}"}
+@app.post("/bookings", status_code=201)
+def book(body: Booking) -> dict[str, int | str]:
+    connection = connect()
 
+    found = connection.execute("SELECT seats_left FROM shows WHERE code = ?", (body.code,)).fetchall()
+    if not found:
+        connection.close()
+        raise HTTPException(status_code=404, detail="Δεν υπάρχει τέτοια παράσταση")
 
-@app.post("/orders", status_code=201)
-def create_order(order: NewOrder) -> dict[str, str]:
-    connection = sqlite3.connect(DB)
+    seats_left = found[0][0]
+    if seats_left < 1:
+        connection.close()
+        raise HTTPException(status_code=409, detail="Δεν έμειναν θέσεις")
+
+    connection.execute("UPDATE shows SET seats_left = ? WHERE code = ?", (seats_left - 1, body.code))
     cursor = connection.execute(
-        "INSERT INTO orders (email, total_cents) VALUES (?, ?)",
-        (order.email, order.total_cents),
+        "INSERT INTO bookings (code, customer) VALUES (?, ?)", (body.code, body.customer)
     )
     connection.commit()
-    order_id = cursor.lastrowid
+    booking_id = cursor.lastrowid
     connection.close()
-
-    tasks.send_receipt(order_id, order.email)
-
-    return {"order_id": str(order_id), "status": "η απόδειξη στάλθηκε"}
+    return {"id": booking_id or 0, "code": body.code}

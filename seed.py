@@ -1,26 +1,35 @@
-"""Φτιάχνει το shop.db. Τρέξε: python3 seed.py"""
+"""Φτιάχνει τη βάση από την αρχή. Τρέξε: python3 seed.py
+
+Μία παράσταση, είκοσι θέσεις, καμία κράτηση.
+"""
 
 import sqlite3
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-DB = HERE / "shop.db"
+DB = HERE / "hall.db"
 
-PRODUCTS = [("KAF-500", 640), ("ZAX-1", 115), ("GAL-1", 160)]
-
-if DB.exists():
-    DB.unlink()
+DB.unlink(missing_ok=True)
 
 connection = sqlite3.connect(DB)
 connection.executescript(
     """
-    CREATE TABLE products (code TEXT PRIMARY KEY, price_cents INTEGER NOT NULL);
-    CREATE TABLE orders (id INTEGER PRIMARY KEY, email TEXT NOT NULL, total_cents INTEGER NOT NULL);
-    CREATE TABLE receipts (id INTEGER PRIMARY KEY, order_id INTEGER NOT NULL);
+    CREATE TABLE shows (
+        code       TEXT PRIMARY KEY,
+        title      TEXT NOT NULL,
+        seats_left INTEGER NOT NULL
+    );
+
+    CREATE TABLE bookings (
+        id       INTEGER PRIMARY KEY AUTOINCREMENT,
+        code     TEXT NOT NULL,
+        customer TEXT NOT NULL
+    );
+
+    INSERT INTO shows (code, title, seats_left) VALUES ('PAR-1', 'Η βραδιά των δέκα', 20);
     """
 )
-connection.executemany("INSERT INTO products VALUES (?, ?)", PRODUCTS)
 connection.commit()
 connection.close()
 
-print(f"Έτοιμο: {DB.name} με {len(PRODUCTS)} προϊόντα και καμία παραγγελία")
+print("Έτοιμη η βάση: PAR-1, είκοσι θέσεις.")

@@ -1,8 +1,8 @@
 """Ο βαθμολογητής του lab. Τρέξε: python3 checks.py
 
-Κοιτάει τρία πράγματα μαζί: τι κρατάει το cache, τι φεύγει από το request, και
-τι γίνεται όταν το ίδιο job τρέξει δεύτερη φορά. Ξαναφτιάχνει τη βάση κάθε
-φορά. Σταμάτα τον δικό σου uvicorn πριν το τρέξεις.
+Ρίχνει φορτίο και μετράει: πόσο κάνουν τα πολλά μαζί, αν το /health απαντάει
+όσο τρέχουν, και πόσες θέσεις πούλησε το service που είχε είκοσι.
+Ξαναφτιάχνει τη βάση κάθε φορά. Σταμάτα τον δικό σου uvicorn πριν το τρέξεις.
 """
 
 import json
@@ -10,24 +10,23 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-import redis
-from rq import Queue
-
-import tasks as tasks_module
+from outside import crunch, occupancy_of
 
 HERE = Path(__file__).resolve().parent
-DB = HERE / "shop.db"
 HOST = "127.0.0.1"
 PORT = 8000
 BASE = f"http://{HOST}:{PORT}"
-BUDGET_MS = 300.0
-CUSTOMER = "maria@example.gr"
+SHOW = "PAR-1"
+SEATS = 20
+CROWD = 50
 
 results: list[tuple[bool, str]] = []
 
@@ -48,37 +47,58 @@ def port_is_free() -> bool:
         probe.close()
 
 
-def call(path: str, payload: Any = None, method: str = "GET") -> tuple[int, Any, float]:
-    started = time.perf_counter()
-    data = None if payload is None else json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(
-        f"{BASE}{path}",
-        data=data,
-        headers={"Content-Type": "application/json"} if data else {},
-        method=method,
-    )
+def call(path: str, method: str = "GET", payload: Any = None, timeout: float = 60.0) -> tuple[int, Any]:
+    data = None
+    headers = {}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(f"{BASE}{path}", data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(request, timeout=30) as answer:
+        with urllib.request.urlopen(request, timeout=timeout) as answer:
             raw = answer.read().decode("utf-8")
-            elapsed = (time.perf_counter() - started) * 1000
-            try:
-                body = json.loads(raw) if raw else None
-            except json.JSONDecodeError:
-                body = raw
-            return answer.status, body, elapsed
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError):
-        return 0, None, (time.perf_counter() - started) * 1000
+            return answer.status, json.loads(raw) if raw else None
+    except urllib.error.HTTPError as failure:
+        return failure.code, None
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+        return 0, None
 
 
-def wait_until_up(process: "subprocess.Popen[bytes]", seconds: float = 40.0) -> bool:
+def query_db(sql: str, parameters: tuple = ()) -> list[tuple]:
+    connection = sqlite3.connect(HERE / "hall.db")
+    found = connection.execute(sql, parameters).fetchall()
+    connection.close()
+    return found
+
+
+def reseed() -> None:
+    subprocess.run(
+        [sys.executable, str(HERE / "seed.py")], cwd=HERE, stdout=subprocess.DEVNULL, check=True
+    )
+
+
+def wait_until_up(process: "subprocess.Popen[bytes]", seconds: float = 30.0) -> bool:
     deadline = time.time() + seconds
     while time.time() < deadline:
         if process.poll() is not None:
             return False
-        if call("/docs")[0] != 0:
+        if call("/health", timeout=2.0)[0] == 200:
             return True
         time.sleep(0.3)
     return False
+
+
+def health_while(work: "threading.Thread") -> float:
+    delays: list[float] = []
+    work.start()
+    time.sleep(0.15)
+    while work.is_alive():
+        mark = time.time()
+        call("/health", timeout=20.0)
+        delays.append(time.time() - mark)
+        time.sleep(0.05)
+    work.join()
+    return max(delays) if delays else 99.0
 
 
 if not (HERE / "main.py").exists():
@@ -89,15 +109,7 @@ if not port_is_free():
     print(f"Η θύρα {PORT} είναι πιασμένη. Σταμάτα το service σου και ξανατρέξε.")
     sys.exit(1)
 
-try:
-    cache = redis.Redis(decode_responses=True)
-    cache.ping()
-except redis.RedisError:
-    print("Δεν βρήκα Redis στο 6379. Ξεκίνα το με: sudo service redis-server start")
-    sys.exit(1)
-
-cache.flushdb()
-subprocess.run([sys.executable, str(HERE / "seed.py")], cwd=HERE, stdout=subprocess.DEVNULL, check=True)
+reseed()
 
 service = subprocess.Popen(
     [sys.executable, "-m", "uvicorn", "main:app", "--host", HOST, "--port", str(PORT)],
@@ -109,67 +121,59 @@ service = subprocess.Popen(
 try:
     report("Το service ξεκινάει και απαντάει στο 8000", wait_until_up(service))
 
-    status, first, _ = call("/products/KAF-500/price")
-    status, second, warm_ms = call("/products/KAF-500/price")
+    status, one = call("/report/A")
     report(
-        f"Η δεύτερη κλήση της τιμής απαντάει κάτω από 20 ms ({warm_ms:.1f})",
-        status == 200 and second == first and warm_ms < 20.0,
+        "Το /report δίνει τη σωστή πληρότητα",
+        status == 200 and isinstance(one, dict) and one.get("occupancy") == occupancy_of("A"),
     )
 
-    price_keys = [key for key in cache.keys("*") if "KAF-500" in key]
+    halls = [f"HALL-{number:02d}" for number in range(CROWD)]
+    started = time.time()
+    with ThreadPoolExecutor(max_workers=CROWD) as visitors:
+        codes = list(visitors.map(lambda hall: call(f"/report/{hall}")[0], halls))
+    report_seconds = time.time() - started
     report(
-        "Το κλειδί της τιμής ζει στο Redis και έχει προθεσμία λήξης",
-        bool(price_keys) and all(cache.ttl(key) > 0 for key in price_keys),
+        f"Πενήντα ταυτόχρονα /report τελειώνουν κάτω από 2 δευτερόλεπτα ({report_seconds:.2f}s)",
+        all(code == 200 for code in codes) and report_seconds < 2.0,
     )
 
-    call("/products/KAF-500/price", {"price_cents": 710}, "PUT")
-    status, after, _ = call("/products/KAF-500/price")
+    def report_rush() -> None:
+        with ThreadPoolExecutor(max_workers=20) as visitors:
+            list(visitors.map(lambda number: call(f"/report/HALL-{number:02d}"), range(20)))
+
+    load = threading.Thread(target=report_rush)
     report(
-        "Μετά την αλλαγή τιμής σερβίρεται η καινούρια, όχι η παλιά",
-        status == 200 and isinstance(after, dict) and after.get("price") == "7.10",
+        "Το /health απαντάει κι όσο τρέχουν τα /report",
+        health_while(load) < 0.3,
     )
 
-    status, created, elapsed_ms = call(
-        "/orders", {"email": CUSTOMER, "total_cents": 4520}, "POST"
-    )
+    status, heavy = call("/crunch/3")
     report(
-        f"Η παραγγελία απαντάει χωρίς να περιμένει το email ({elapsed_ms:.0f} ms)",
-        status == 201 and elapsed_ms < BUDGET_MS,
+        "Το /crunch δίνει το σωστό σύνολο",
+        status == 200 and isinstance(heavy, dict) and heavy.get("total") == crunch(3),
     )
 
-    connection = sqlite3.connect(DB)
-    rows = connection.execute("SELECT id FROM orders").fetchall()
-    connection.close()
-    order_id = rows[0][0] if rows else 0
-
-    queue = Queue(connection=redis.Redis())
-    report("Ένα job περιμένει στο queue", queue.count == 1)
-
-    subprocess.run(
-        [sys.executable, "-m", "rq.cli", "worker", "--burst"],
-        cwd=HERE, capture_output=True, text=True, timeout=60,
-    )
-    connection = sqlite3.connect(DB)
-    receipts_once = connection.execute(
-        "SELECT COUNT(*) FROM receipts WHERE order_id = ?", (order_id,)
-    ).fetchone()[0]
-    connection.close()
-    report("Ο worker στέλνει την απόδειξη μία φορά", receipts_once == 1)
-
-    queue.enqueue(tasks_module.send_receipt, order_id, CUSTOMER)
-    subprocess.run(
-        [sys.executable, "-m", "rq.cli", "worker", "--burst"],
-        cwd=HERE, capture_output=True, text=True, timeout=60,
-    )
-    connection = sqlite3.connect(DB)
-    receipts_twice = connection.execute(
-        "SELECT COUNT(*) FROM receipts WHERE order_id = ?", (order_id,)
-    ).fetchone()[0]
-    connection.close()
+    burn = threading.Thread(target=lambda: call("/crunch/5"))
     report(
-        f"Το ίδιο job δεύτερη φορά δεν στέλνει δεύτερη απόδειξη ({receipts_twice})",
-        receipts_twice == 1,
+        "Το /health απαντάει κι όσο τρέχει το /crunch",
+        health_while(burn) < 0.3,
     )
+
+    reseed()
+
+    def grab(number: int) -> int:
+        return call("/bookings", "POST", {"code": SHOW, "customer": f"theatis-{number}"})[0]
+
+    with ThreadPoolExecutor(max_workers=CROWD) as crowd:
+        booking_codes = list(crowd.map(grab, range(CROWD)))
+
+    accepted = sum(1 for code in booking_codes if code == 201)
+    seats_left = query_db("SELECT seats_left FROM shows WHERE code = ?", (SHOW,))[0][0]
+    written = query_db("SELECT COUNT(*) FROM bookings")[0][0]
+
+    report(f"Από τους πενήντα κλείνουν ακριβώς είκοσι ({accepted})", accepted == SEATS)
+    report(f"Οι θέσεις καταλήγουν στο μηδέν, ποτέ αρνητικές ({seats_left})", seats_left == 0)
+    report(f"Οι κρατήσεις στη βάση είναι όσες και οι επιτυχίες ({written})", written == accepted)
 finally:
     service.terminate()
     try:
