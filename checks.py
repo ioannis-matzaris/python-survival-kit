@@ -157,7 +157,7 @@ report(
     len(mine) >= 1,
 )
 
-report("Η απάντηση γυρίζει πίσω το X-Request-ID", echoed == MY_ID)
+report("Η απάντηση φέρνει πίσω το X-Request-ID", echoed == MY_ID)
 
 own = [
     one.get("request_id")
