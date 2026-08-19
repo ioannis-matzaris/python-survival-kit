@@ -1,32 +1,27 @@
 """Ο βαθμολογητής του lab. Τρέξε: python3 checks.py
 
-Ρίχνει φορτίο και μετράει: πόσο κάνουν τα πολλά μαζί, αν το /health απαντάει
-όσο τρέχουν, και πόσες θέσεις πούλησε το service που είχε είκοσι.
-Ξαναφτιάχνει τη βάση κάθε φορά. Σταμάτα τον δικό σου uvicorn πριν το τρέξεις.
+Σηκώνει και τον πάροχο και το service σου, και μετά τους βάζει σε δύσκολη
+θέση: μια πόρτα που κρέμεται, μια που αποτυγχάνει δύο φορές, και μια που δεν
+συνέρχεται ποτέ. Σταμάτα τον δικό σου uvicorn πριν το τρέξεις.
 """
 
 import json
+import re
 import socket
-import sqlite3
 import subprocess
 import sys
-import threading
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
-
-from outside import crunch, occupancy_of
 
 HERE = Path(__file__).resolve().parent
 HOST = "127.0.0.1"
 PORT = 8000
+UPSTREAM_PORT = 8001
 BASE = f"http://{HOST}:{PORT}"
-SHOW = "PAR-1"
-SEATS = 20
-CROWD = 50
+UPSTREAM = f"http://{HOST}:{UPSTREAM_PORT}"
 
 results: list[tuple[bool, str]] = []
 
@@ -35,11 +30,11 @@ def report(label: str, passed: bool) -> None:
     results.append((passed, label))
 
 
-def port_is_free() -> bool:
+def port_is_free(port: int) -> bool:
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
-        probe.bind((HOST, PORT))
+        probe.bind((HOST, port))
         return True
     except OSError:
         return False
@@ -47,144 +42,112 @@ def port_is_free() -> bool:
         probe.close()
 
 
-def call(path: str, method: str = "GET", payload: Any = None, timeout: float = 60.0) -> tuple[int, Any]:
-    data = None
-    headers = {}
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(f"{BASE}{path}", data=data, headers=headers, method=method)
+def fetch(url: str, method: str = "GET", timeout: float = 30.0) -> tuple[int, Any, float]:
+    started = time.time()
+    request = urllib.request.Request(url, method=method)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as answer:
             raw = answer.read().decode("utf-8")
-            return answer.status, json.loads(raw) if raw else None
+            return answer.status, json.loads(raw) if raw else None, time.time() - started
     except urllib.error.HTTPError as failure:
-        return failure.code, None
+        return failure.code, None, time.time() - started
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
-        return 0, None
+        return 0, None, time.time() - started
 
 
-def query_db(sql: str, parameters: tuple = ()) -> list[tuple]:
-    connection = sqlite3.connect(HERE / "hall.db")
-    found = connection.execute(sql, parameters).fetchall()
-    connection.close()
-    return found
+def calls_to(name: str) -> int:
+    status, body, _ = fetch(f"{UPSTREAM}/calls/{name}", timeout=10.0)
+    return body.get("calls", -1) if status == 200 and isinstance(body, dict) else -1
 
 
-def reseed() -> None:
-    subprocess.run(
-        [sys.executable, str(HERE / "seed.py")], cwd=HERE, stdout=subprocess.DEVNULL, check=True
+def start(module: str, port: int) -> "subprocess.Popen[bytes]":
+    return subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", f"{module}:app", "--host", HOST, "--port", str(port)],
+        cwd=HERE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
 
 
-def wait_until_up(process: "subprocess.Popen[bytes]", seconds: float = 30.0) -> bool:
+def wait_until_up(process: "subprocess.Popen[bytes]", url: str, seconds: float = 30.0) -> bool:
     deadline = time.time() + seconds
     while time.time() < deadline:
         if process.poll() is not None:
             return False
-        if call("/health", timeout=2.0)[0] == 200:
+        if fetch(url, timeout=2.0)[0] == 200:
             return True
         time.sleep(0.3)
     return False
-
-
-def health_while(work: "threading.Thread") -> float:
-    delays: list[float] = []
-    work.start()
-    time.sleep(0.15)
-    while work.is_alive():
-        mark = time.time()
-        call("/health", timeout=20.0)
-        delays.append(time.time() - mark)
-        time.sleep(0.05)
-    work.join()
-    return max(delays) if delays else 99.0
 
 
 if not (HERE / "main.py").exists():
     print("Δεν βρήκα το main.py στη ρίζα του repo.")
     sys.exit(1)
 
-if not port_is_free():
-    print(f"Η θύρα {PORT} είναι πιασμένη. Σταμάτα το service σου και ξανατρέξε.")
-    sys.exit(1)
+for one in (PORT, UPSTREAM_PORT):
+    if not port_is_free(one):
+        print(f"Η θύρα {one} είναι πιασμένη. Σταμάτα τα services σου και ξανατρέξε.")
+        sys.exit(1)
 
-reseed()
-
-service = subprocess.Popen(
-    [sys.executable, "-m", "uvicorn", "main:app", "--host", HOST, "--port", str(PORT)],
-    cwd=HERE,
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL,
-)
+provider = start("upstream", UPSTREAM_PORT)
+service = start("main", PORT)
 
 try:
-    report("Το service ξεκινάει και απαντάει στο 8000", wait_until_up(service))
-
-    status, one = call("/report/A")
-    report(
-        "Το /report δίνει τη σωστή πληρότητα",
-        status == 200 and isinstance(one, dict) and one.get("occupancy") == occupancy_of("A"),
+    up = wait_until_up(provider, f"{UPSTREAM}/calls/slow") and wait_until_up(
+        service, f"{BASE}/health"
     )
+    report("Ο πάροχος και το service ξεκινάνε", up)
+    fetch(f"{UPSTREAM}/reset", "POST", timeout=10.0)
 
-    halls = [f"HALL-{number:02d}" for number in range(CROWD)]
-    started = time.time()
-    with ThreadPoolExecutor(max_workers=CROWD) as visitors:
-        codes = list(visitors.map(lambda hall: call(f"/report/{hall}")[0], halls))
-    report_seconds = time.time() - started
+    status, _, slow_seconds = fetch(f"{BASE}/quote", timeout=15.0)
     report(
-        f"Πενήντα ταυτόχρονα /report τελειώνουν κάτω από 2 δευτερόλεπτα ({report_seconds:.2f}s)",
-        all(code == 200 for code in codes) and report_seconds < 2.0,
+        f"Το /quote δεν κρέμεται στον αργό πάροχο ({slow_seconds:.1f}s)",
+        status != 0 and slow_seconds < 10.0,
     )
+    report(f"Και απαντάει 504 στον πελάτη ({status})", status == 504)
 
-    def report_rush() -> None:
-        with ThreadPoolExecutor(max_workers=20) as visitors:
-            list(visitors.map(lambda number: call(f"/report/HALL-{number:02d}"), range(20)))
-
-    load = threading.Thread(target=report_rush)
+    status, rate, flaky_seconds = fetch(f"{BASE}/rates", timeout=30.0)
     report(
-        "Το /health απαντάει κι όσο τρέχουν τα /report",
-        health_while(load) < 0.3,
+        "Το /rates πετυχαίνει παρά τις δύο αποτυχίες του παρόχου",
+        status == 200 and isinstance(rate, dict) and rate.get("rate_cents") == 10850,
     )
-
-    status, heavy = call("/crunch/3")
     report(
-        "Το /crunch δίνει το σωστό σύνολο",
-        status == 200 and isinstance(heavy, dict) and heavy.get("total") == crunch(3),
+        f"Οι επαναλήψεις περιμένουν ανάμεσά τους ({flaky_seconds:.2f}s)",
+        status == 200 and flaky_seconds >= 0.8,
     )
+    report(f"Και δεν ξαναρώτησαν παραπάνω από τρεις φορές ({calls_to('flaky')})", calls_to("flaky") == 3)
 
-    burn = threading.Thread(target=lambda: call("/crunch/5"))
+    status, _, broken_seconds = fetch(f"{BASE}/rates/backup", timeout=30.0)
+    tried = calls_to("broken")
     report(
-        "Το /health απαντάει κι όσο τρέχει το /crunch",
-        health_while(burn) < 0.3,
+        f"Στον μόνιμα χαλασμένο πάροχο το service παραιτείται και απαντάει ({status})",
+        status == 502,
     )
-
-    reseed()
-
-    def grab(number: int) -> int:
-        return call("/bookings", "POST", {"code": SHOW, "customer": f"theatis-{number}"})[0]
-
-    with ThreadPoolExecutor(max_workers=CROWD) as crowd:
-        booking_codes = list(crowd.map(grab, range(CROWD)))
-
-    accepted = sum(1 for code in booking_codes if code == 201)
-    seats_left = query_db("SELECT seats_left FROM shows WHERE code = ?", (SHOW,))[0][0]
-    written = query_db("SELECT COUNT(*) FROM bookings")[0][0]
-
-    report(f"Από τους πενήντα κλείνουν ακριβώς είκοσι ({accepted})", accepted == SEATS)
-    report(f"Οι θέσεις καταλήγουν στο μηδέν, ποτέ αρνητικές ({seats_left})", seats_left == 0)
-    report(f"Οι κρατήσεις στη βάση είναι όσες και οι επιτυχίες ({written})", written == accepted)
+    report(f"Και δεν του έριξε πάνω από τέσσερις κλήσεις ({tried})", 0 < tried <= 4)
 finally:
-    service.terminate()
-    try:
-        service.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        service.kill()
+    for one in (service, provider):
+        one.terminate()
+        try:
+            one.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            one.kill()
+
+source = (HERE / "main.py").read_text(encoding="utf-8")
+naked = [
+    line.strip()
+    for line in source.splitlines()
+    if re.search(r"requests\.(get|post|put|delete|request)\(", line) and "timeout" not in line
+]
+report(
+    f"Καμία κλήση προς τα έξω χωρίς timeout ({len(naked)})",
+    not naked and "requests" in source,
+)
+report("Δεν έμεινε ατέρμονο while True στον κώδικα", "while True" not in source)
 
 total_checks = len(results)
 for index, (passed, label) in enumerate(results, start=1):
     mark = "✅" if passed else "❌"
-    print(f"[{index}/{total_checks}] {label}".ljust(68) + f" {mark}")
+    print(f"[{index}/{total_checks}] {label}".ljust(70) + f" {mark}")
 
 score = sum(1 for passed, _ in results if passed)
 print()
