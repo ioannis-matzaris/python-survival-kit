@@ -3,3 +3,5 @@ __pycache__/
 shop.db
 checks.db
 users.db
+
+pids-*.txt
