@@ -1,33 +1,28 @@
 """Ο βαθμολογητής του lab. Τρέξε: python3 checks.py
 
-Κοιτάει τρία πράγματα μαζί: τι κρατάει το cache, τι φεύγει από το request, και
-τι γίνεται όταν το ίδιο job τρέξει δεύτερη φορά. Ξαναφτιάχνει τη βάση κάθε
-φορά. Σταμάτα τον δικό σου uvicorn πριν το τρέξεις.
+Μετράει δύο πράγματα: πόσο κάνουν δέκα κλήσεις, και αν το service απαντάει σε
+κάτι άλλο όσο τις κάνει. Σταμάτα τον δικό σου uvicorn πριν το τρέξεις.
 """
 
 import json
 import socket
-import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
 
-import redis
-from rq import Queue
-
-import tasks as tasks_module
+from upstream import price_of
 
 HERE = Path(__file__).resolve().parent
-DB = HERE / "shop.db"
 HOST = "127.0.0.1"
 PORT = 8000
 BASE = f"http://{HOST}:{PORT}"
-BUDGET_MS = 300.0
-CUSTOMER = "maria@example.gr"
+SKUS = [f"SKU-{number:03d}" for number in range(1, 11)]
 
 results: list[tuple[bool, str]] = []
 
@@ -48,34 +43,27 @@ def port_is_free() -> bool:
         probe.close()
 
 
-def call(path: str, payload: Any = None, method: str = "GET") -> tuple[int, Any, float]:
-    started = time.perf_counter()
-    data = None if payload is None else json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(
-        f"{BASE}{path}",
-        data=data,
-        headers={"Content-Type": "application/json"} if data else {},
-        method=method,
-    )
+def call(path: str, timeout: float = 30.0) -> tuple[int, Any]:
     try:
-        with urllib.request.urlopen(request, timeout=30) as answer:
+        with urllib.request.urlopen(f"{BASE}{path}", timeout=timeout) as answer:
             raw = answer.read().decode("utf-8")
-            elapsed = (time.perf_counter() - started) * 1000
-            try:
-                body = json.loads(raw) if raw else None
-            except json.JSONDecodeError:
-                body = raw
-            return answer.status, body, elapsed
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError):
-        return 0, None, (time.perf_counter() - started) * 1000
+            return answer.status, json.loads(raw) if raw else None
+    except urllib.error.HTTPError as failure:
+        return failure.code, None
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+        return 0, None
 
 
-def wait_until_up(process: "subprocess.Popen[bytes]", seconds: float = 40.0) -> bool:
+def prices_path(skus: list[str]) -> str:
+    return "/prices?" + urllib.parse.urlencode([("sku", one) for one in skus])
+
+
+def wait_until_up(process: "subprocess.Popen[bytes]", seconds: float = 30.0) -> bool:
     deadline = time.time() + seconds
     while time.time() < deadline:
         if process.poll() is not None:
             return False
-        if call("/docs")[0] != 0:
+        if call("/health", timeout=2.0)[0] == 200:
             return True
         time.sleep(0.3)
     return False
@@ -89,16 +77,6 @@ if not port_is_free():
     print(f"Η θύρα {PORT} είναι πιασμένη. Σταμάτα το service σου και ξανατρέξε.")
     sys.exit(1)
 
-try:
-    cache = redis.Redis(decode_responses=True)
-    cache.ping()
-except redis.RedisError:
-    print("Δεν βρήκα Redis στο 6379. Ξεκίνα το με: sudo service redis-server start")
-    sys.exit(1)
-
-cache.flushdb()
-subprocess.run([sys.executable, str(HERE / "seed.py")], cwd=HERE, stdout=subprocess.DEVNULL, check=True)
-
 service = subprocess.Popen(
     [sys.executable, "-m", "uvicorn", "main:app", "--host", HOST, "--port", str(PORT)],
     cwd=HERE,
@@ -109,66 +87,58 @@ service = subprocess.Popen(
 try:
     report("Το service ξεκινάει και απαντάει στο 8000", wait_until_up(service))
 
-    status, first, _ = call("/products/KAF-500/price")
-    status, second, warm_ms = call("/products/KAF-500/price")
-    report(
-        f"Η δεύτερη κλήση της τιμής απαντάει κάτω από 20 ms ({warm_ms:.1f})",
-        status == 200 and second == first and warm_ms < 20.0,
-    )
+    started = time.time()
+    status, many = call(prices_path(SKUS))
+    ten_seconds = time.time() - started
+    rows = many.get("prices") if isinstance(many, dict) else None
 
-    price_keys = [key for key in cache.keys("*") if "KAF-500" in key]
     report(
-        "Το κλειδί της τιμής ζει στο Redis και έχει προθεσμία λήξης",
-        bool(price_keys) and all(cache.ttl(key) > 0 for key in price_keys),
-    )
-
-    call("/products/KAF-500/price", {"price_cents": 710}, "PUT")
-    status, after, _ = call("/products/KAF-500/price")
-    report(
-        "Μετά την αλλαγή τιμής σερβίρεται η καινούρια, όχι η παλιά",
-        status == 200 and isinstance(after, dict) and after.get("price") == "7.10",
-    )
-
-    status, created, elapsed_ms = call(
-        "/orders", {"email": CUSTOMER, "total_cents": 4520}, "POST"
+        "Τα δέκα SKU επιστρέφονται όλα, στη σειρά που ζητήθηκαν",
+        status == 200
+        and isinstance(rows, list)
+        and [row.get("sku") for row in rows] == SKUS,
     )
     report(
-        f"Η παραγγελία απαντάει χωρίς να περιμένει το email ({elapsed_ms:.0f} ms)",
-        status == 201 and elapsed_ms < BUDGET_MS,
+        "Οι τιμές είναι οι σωστές",
+        isinstance(rows, list)
+        and all(row.get("price_cents") == price_of(row.get("sku", "")) for row in rows),
     )
 
-    connection = sqlite3.connect(DB)
-    rows = connection.execute("SELECT id FROM orders").fetchall()
-    connection.close()
-    order_id = rows[0][0] if rows else 0
-
-    queue = Queue(connection=redis.Redis())
-    report("Ένα job περιμένει στο queue", queue.count == 1)
-
-    subprocess.run(
-        [sys.executable, "-m", "rq.cli", "worker", "--burst"],
-        cwd=HERE, capture_output=True, text=True, timeout=60,
-    )
-    connection = sqlite3.connect(DB)
-    receipts_once = connection.execute(
-        "SELECT COUNT(*) FROM receipts WHERE order_id = ?", (order_id,)
-    ).fetchone()[0]
-    connection.close()
-    report("Ο worker στέλνει την απόδειξη μία φορά", receipts_once == 1)
-
-    queue.enqueue(tasks_module.send_receipt, order_id, CUSTOMER)
-    subprocess.run(
-        [sys.executable, "-m", "rq.cli", "worker", "--burst"],
-        cwd=HERE, capture_output=True, text=True, timeout=60,
-    )
-    connection = sqlite3.connect(DB)
-    receipts_twice = connection.execute(
-        "SELECT COUNT(*) FROM receipts WHERE order_id = ?", (order_id,)
-    ).fetchone()[0]
-    connection.close()
+    status, one = call(prices_path(["SKU-001"]))
+    single = one.get("prices") if isinstance(one, dict) else None
     report(
-        f"Το ίδιο job δεύτερη φορά δεν στέλνει δεύτερη απόδειξη ({receipts_twice})",
-        receipts_twice == 1,
+        "Ένα SKU δουλεύει κι αυτό",
+        status == 200
+        and isinstance(single, list)
+        and len(single) == 1
+        and single[0].get("price_cents") == price_of("SKU-001"),
+    )
+
+    report(f"Οι δέκα κλήσεις τελειώνουν κάτω από 1 δευτερόλεπτο ({ten_seconds:.2f}s)", ten_seconds < 1.0)
+
+    health_delays: list[float] = []
+
+    def measure_health() -> None:
+        time.sleep(0.15)
+        for _ in range(3):
+            mark = time.time()
+            call("/health", timeout=10.0)
+            health_delays.append(time.time() - mark)
+
+    watcher = threading.Thread(target=measure_health)
+    watcher.start()
+    call(prices_path(SKUS))
+    watcher.join()
+    slowest = max(health_delays) if health_delays else 99.0
+    report(
+        f"Το /health απαντάει κι όσο τρέχουν οι κλήσεις ({slowest * 1000:.0f}ms)",
+        slowest < 0.2,
+    )
+
+    source = (HERE / "main.py").read_text(encoding="utf-8")
+    report(
+        "Ο handler δεν καλεί τον blocking client",
+        "fetch_price_blocking" not in source and "time.sleep" not in source,
     )
 finally:
     service.terminate()
@@ -180,7 +150,7 @@ finally:
 total_checks = len(results)
 for index, (passed, label) in enumerate(results, start=1):
     mark = "✅" if passed else "❌"
-    print(f"[{index}/{total_checks}] {label}".ljust(68) + f" {mark}")
+    print(f"[{index}/{total_checks}] {label}".ljust(64) + f" {mark}")
 
 score = sum(1 for passed, _ in results if passed)
 print()
