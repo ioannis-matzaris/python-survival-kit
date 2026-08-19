@@ -170,7 +170,7 @@ try:
         status == 200 and isinstance(tracking, dict) and tracking.get("tracking") == "EL001001GR",
     )
     echoed = headers.get("X-Request-ID") or headers.get("x-request-id")
-    report("Η απάντηση γυρίζει πίσω το X-Request-ID", echoed == MY_ID)
+    report("Η απάντηση φέρνει πίσω το X-Request-ID", echoed == MY_ID)
 
     provider_state(up=False)
     status, _, _, _ = fetch(f"{BASE}/ready", timeout=10.0)
