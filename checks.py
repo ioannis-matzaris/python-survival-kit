@@ -112,10 +112,10 @@ try:
     )
 
     status, _ = call("/orders", "POST", {"sku": SKU, "quantity": 99, "customer": "maria"})
-    report("Παραγγελία πάνω από το απόθεμα γυρίζει 409", status == 409)
+    report("Παραγγελία πάνω από το απόθεμα επιστρέφει 409", status == 409)
 
     status, _ = call("/orders", "POST", {"sku": "SKU-000", "quantity": 1, "customer": "maria"})
-    report("Ανύπαρκτο προϊόν γυρίζει 404", status == 404)
+    report("Ανύπαρκτο προϊόν επιστρέφει 404", status == 404)
 
     reseed()
 
