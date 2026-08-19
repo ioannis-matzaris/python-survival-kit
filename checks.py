@@ -1,32 +1,26 @@
 """Ο βαθμολογητής του lab. Τρέξε: python3 checks.py
 
-Ρίχνει φορτίο και μετράει: πόσο κάνουν τα πολλά μαζί, αν το /health απαντάει
-όσο τρέχουν, και πόσες θέσεις πούλησε το service που είχε είκοσι.
-Ξαναφτιάχνει τη βάση κάθε φορά. Σταμάτα τον δικό σου uvicorn πριν το τρέξεις.
+Σηκώνει το service, μαζεύει ό,τι γράφει στην έξοδό του, και μετά διαβάζει τις
+γραμμές σαν μηχανή: τις φορτώνει με json και ψάχνει τα πεδία. Σταμάτα τον δικό
+σου uvicorn πριν το τρέξεις.
 """
 
 import json
 import socket
-import sqlite3
 import subprocess
 import sys
-import threading
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from outside import crunch, occupancy_of
-
 HERE = Path(__file__).resolve().parent
+LOGFILE = HERE / "checks-output.log"
 HOST = "127.0.0.1"
 PORT = 8000
 BASE = f"http://{HOST}:{PORT}"
-SHOW = "PAR-1"
-SEATS = 20
-CROWD = 50
+MY_ID = "aitima-tou-vathmologiti-42"
 
 results: list[tuple[bool, str]] = []
 
@@ -47,34 +41,19 @@ def port_is_free() -> bool:
         probe.close()
 
 
-def call(path: str, method: str = "GET", payload: Any = None, timeout: float = 60.0) -> tuple[int, Any]:
-    data = None
-    headers = {}
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(f"{BASE}{path}", data=data, headers=headers, method=method)
+def call(
+    path: str, method: str = "GET", request_id: str | None = None
+) -> tuple[int, dict[str, str]]:
+    headers = {"X-Request-ID": request_id} if request_id else {}
+    request = urllib.request.Request(f"{BASE}{path}", headers=headers, method=method)
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as answer:
-            raw = answer.read().decode("utf-8")
-            return answer.status, json.loads(raw) if raw else None
+        with urllib.request.urlopen(request, timeout=10) as answer:
+            answer.read()
+            return answer.status, dict(answer.headers)
     except urllib.error.HTTPError as failure:
-        return failure.code, None
-    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
-        return 0, None
-
-
-def query_db(sql: str, parameters: tuple = ()) -> list[tuple]:
-    connection = sqlite3.connect(HERE / "hall.db")
-    found = connection.execute(sql, parameters).fetchall()
-    connection.close()
-    return found
-
-
-def reseed() -> None:
-    subprocess.run(
-        [sys.executable, str(HERE / "seed.py")], cwd=HERE, stdout=subprocess.DEVNULL, check=True
-    )
+        return failure.code, dict(failure.headers)
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return 0, {}
 
 
 def wait_until_up(process: "subprocess.Popen[bytes]", seconds: float = 30.0) -> bool:
@@ -82,23 +61,36 @@ def wait_until_up(process: "subprocess.Popen[bytes]", seconds: float = 30.0) -> 
     while time.time() < deadline:
         if process.poll() is not None:
             return False
-        if call("/health", timeout=2.0)[0] == 200:
+        if call("/health")[0] == 200:
             return True
         time.sleep(0.3)
     return False
 
 
-def health_while(work: "threading.Thread") -> float:
-    delays: list[float] = []
-    work.start()
-    time.sleep(0.15)
-    while work.is_alive():
-        mark = time.time()
-        call("/health", timeout=20.0)
-        delays.append(time.time() - mark)
-        time.sleep(0.05)
-    work.join()
-    return max(delays) if delays else 99.0
+def json_lines(raw: str) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            one = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(one, dict):
+            found.append(one)
+    return found
+
+
+def text_lines(raw: str) -> list[str]:
+    noise = ("INFO:", "WARNING:", "ERROR:", "Started", "Waiting", "Application", "Uvicorn", "Shutting", "Finished")
+    keep = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("{") or line.startswith(noise):
+            continue
+        keep.append(line)
+    return keep
 
 
 if not (HERE / "main.py").exists():
@@ -109,82 +101,89 @@ if not port_is_free():
     print(f"Η θύρα {PORT} είναι πιασμένη. Σταμάτα το service σου και ξανατρέξε.")
     sys.exit(1)
 
-reseed()
+LOGFILE.unlink(missing_ok=True)
+sink = LOGFILE.open("wb")
 
 service = subprocess.Popen(
     [sys.executable, "-m", "uvicorn", "main:app", "--host", HOST, "--port", str(PORT)],
     cwd=HERE,
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL,
+    stdout=sink,
+    stderr=subprocess.STDOUT,
 )
 
 try:
     report("Το service ξεκινάει και απαντάει στο 8000", wait_until_up(service))
 
-    status, one = call("/report/A")
-    report(
-        "Το /report δίνει τη σωστή πληρότητα",
-        status == 200 and isinstance(one, dict) and one.get("occupancy") == occupancy_of("A"),
-    )
+    status, headers = call("/orders/1001", request_id=MY_ID)
+    mine_ok = status == 200
+    echoed = headers.get("X-Request-ID") or headers.get("x-request-id")
 
-    halls = [f"HALL-{number:02d}" for number in range(CROWD)]
-    started = time.time()
-    with ThreadPoolExecutor(max_workers=CROWD) as visitors:
-        codes = list(visitors.map(lambda hall: call(f"/report/{hall}")[0], halls))
-    report_seconds = time.time() - started
-    report(
-        f"Πενήντα ταυτόχρονα /report τελειώνουν κάτω από 2 δευτερόλεπτα ({report_seconds:.2f}s)",
-        all(code == 200 for code in codes) and report_seconds < 2.0,
-    )
+    call("/orders/9999", request_id="anyparkti-paraggelia")
+    call("/orders/4242/refund", "POST", request_id="apotyximeni-epistrofi")
+    call("/orders/1001/refund", "POST")
 
-    def report_rush() -> None:
-        with ThreadPoolExecutor(max_workers=20) as visitors:
-            list(visitors.map(lambda number: call(f"/report/HALL-{number:02d}"), range(20)))
-
-    load = threading.Thread(target=report_rush)
-    report(
-        "Το /health απαντάει κι όσο τρέχουν τα /report",
-        health_while(load) < 0.3,
-    )
-
-    status, heavy = call("/crunch/3")
-    report(
-        "Το /crunch δίνει το σωστό σύνολο",
-        status == 200 and isinstance(heavy, dict) and heavy.get("total") == crunch(3),
-    )
-
-    burn = threading.Thread(target=lambda: call("/crunch/5"))
-    report(
-        "Το /health απαντάει κι όσο τρέχει το /crunch",
-        health_while(burn) < 0.3,
-    )
-
-    reseed()
-
-    def grab(number: int) -> int:
-        return call("/bookings", "POST", {"code": SHOW, "customer": f"theatis-{number}"})[0]
-
-    with ThreadPoolExecutor(max_workers=CROWD) as crowd:
-        booking_codes = list(crowd.map(grab, range(CROWD)))
-
-    accepted = sum(1 for code in booking_codes if code == 201)
-    seats_left = query_db("SELECT seats_left FROM shows WHERE code = ?", (SHOW,))[0][0]
-    written = query_db("SELECT COUNT(*) FROM bookings")[0][0]
-
-    report(f"Από τους πενήντα κλείνουν ακριβώς είκοσι ({accepted})", accepted == SEATS)
-    report(f"Οι θέσεις καταλήγουν στο μηδέν, ποτέ αρνητικές ({seats_left})", seats_left == 0)
-    report(f"Οι κρατήσεις στη βάση είναι όσες και οι επιτυχίες ({written})", written == accepted)
+    time.sleep(1.0)
 finally:
     service.terminate()
     try:
         service.wait(timeout=5)
     except subprocess.TimeoutExpired:
         service.kill()
+    sink.close()
+
+raw = LOGFILE.read_text(encoding="utf-8", errors="replace")
+lines = json_lines(raw)
+leftovers = text_lines(raw)
+mine = [one for one in lines if one.get("request_id") == MY_ID]
+failed = [one for one in lines if one.get("request_id") == "apotyximeni-epistrofi"]
+
+report("Η ανάγνωση παραγγελίας απαντάει κανονικά", mine_ok)
+
+report(f"Το service γράφει γραμμές JSON ({len(lines)})", len(lines) >= 4)
+
+report(
+    "Καμία γραμμή δεν έμεινε σε ελεύθερο κείμενο",
+    bool(lines) and not leftovers,
+)
+
+report(
+    "Κάθε γραμμή έχει level και μήνυμα",
+    bool(lines)
+    and all(one.get("level") and (one.get("message") or one.get("msg")) for one in lines),
+)
+
+report(
+    f"Οι γραμμές κουβαλάνε το X-Request-ID που έστειλα ({len(mine)})",
+    len(mine) >= 1,
+)
+
+report("Η απάντηση γυρίζει πίσω το X-Request-ID", echoed == MY_ID)
+
+own = [
+    one.get("request_id")
+    for one in lines
+    if one.get("request_id") not in (None, "", MY_ID, "anyparkti-paraggelia", "apotyximeni-epistrofi")
+]
+report(f"Χωρίς header, το service φτιάχνει δικό του id ({len(set(own))})", len(set(own)) >= 1)
+
+report(
+    "Η αποτυχία του παρόχου γράφει ολόκληρο το traceback",
+    any("ProviderError" in json.dumps(one, ensure_ascii=False) for one in failed),
+)
+
+report(
+    "Τα ελληνικά μένουν ελληνικά, όχι \\u escapes",
+    "\\u03" not in raw and any("α" <= letter <= "ω" for letter in raw),
+)
+
+report("Δεν έμεινε print στο main.py", "print(" not in (HERE / "main.py").read_text(encoding="utf-8"))
+
+LOGFILE.unlink(missing_ok=True)
 
 total_checks = len(results)
 for index, (passed, label) in enumerate(results, start=1):
     mark = "✅" if passed else "❌"
-    print(f"[{index}/{total_checks}] {label}".ljust(68) + f" {mark}")
+    print(f"[{index}/{total_checks}] {label}".ljust(66) + f" {mark}")
 
 score = sum(1 for passed, _ in results if passed)
 print()

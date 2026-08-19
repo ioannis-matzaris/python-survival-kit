@@ -3,3 +3,4 @@ __pycache__/
 shop.db
 checks.db
 users.db
+checks-output.log
